@@ -1,0 +1,42 @@
+# Test profile configuration
+spring:
+  datasource:
+    # TestContainers will override these values
+    url: jdbc:postgresql://localhost:5432/stacks_monitor_test
+    username: test
+    password: test
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  # Disable async for tests
+  task:
+    execution:
+      pool:
+        core-size: 1
+        max-size: 1
+
+# Disable rate limiting for tests
+security:
+  rate-limit:
+    enabled: false
+
+# Disable notifications for tests
+stacks:
+  monitoring:
+    notification:
+      email:
+        enabled: false
+      webhook:
+        enabled: false
+
+logging:
+  level:
+    root: INFO
+    com.stacksmonitoring: DEBUG
+    org.springframework.test: INFO
