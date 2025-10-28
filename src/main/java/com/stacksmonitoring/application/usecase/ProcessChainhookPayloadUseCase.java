@@ -3,8 +3,11 @@ package com.stacksmonitoring.application.usecase;
 import com.stacksmonitoring.api.dto.webhook.BlockEventDto;
 import com.stacksmonitoring.api.dto.webhook.ChainhookPayloadDto;
 import com.stacksmonitoring.api.dto.webhook.TransactionDto;
+import com.stacksmonitoring.application.service.AlertMatchingService;
+import com.stacksmonitoring.application.service.NotificationDispatcher;
 import com.stacksmonitoring.domain.model.blockchain.StacksBlock;
 import com.stacksmonitoring.domain.model.blockchain.StacksTransaction;
+import com.stacksmonitoring.domain.model.monitoring.AlertNotification;
 import com.stacksmonitoring.domain.repository.StacksBlockRepository;
 import com.stacksmonitoring.infrastructure.parser.ChainhookPayloadParser;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +24,7 @@ import java.util.Optional;
  * Use case for processing Chainhook webhook payloads.
  * Handles both apply (new blocks) and rollback (blockchain reorganization) events.
  * Implements batch processing for optimal database performance.
+ * Evaluates alert rules and triggers notifications after persisting transactions.
  */
 @Service
 @RequiredArgsConstructor
@@ -29,6 +33,8 @@ public class ProcessChainhookPayloadUseCase {
 
     private final ChainhookPayloadParser parser;
     private final StacksBlockRepository blockRepository;
+    private final AlertMatchingService alertMatchingService;
+    private final NotificationDispatcher notificationDispatcher;
 
     /**
      * Process a complete Chainhook webhook payload.
@@ -105,9 +111,11 @@ public class ProcessChainhookPayloadUseCase {
     /**
      * Handle apply events (new blocks).
      * Processes blocks and transactions in batches for optimal performance.
+     * Evaluates alert rules after persisting transactions.
      */
     private int handleApplies(List<BlockEventDto> applyEvents) {
         int count = 0;
+        List<AlertNotification> allNotifications = new ArrayList<>();
 
         for (BlockEventDto blockEvent : applyEvents) {
             // Check if block already exists (idempotency)
@@ -152,6 +160,29 @@ public class ProcessChainhookPayloadUseCase {
 
             log.info("Persisted block {} (height {}) with {} transactions",
                 blockHash, block.getBlockHeight(), block.getTransactions().size());
+
+            // Evaluate alert rules for each transaction
+            for (StacksTransaction transaction : block.getTransactions()) {
+                try {
+                    List<AlertNotification> notifications = alertMatchingService.evaluateTransaction(transaction);
+                    allNotifications.addAll(notifications);
+
+                    if (!notifications.isEmpty()) {
+                        log.info("Transaction {} triggered {} alerts",
+                            transaction.getTxId(), notifications.size());
+                    }
+                } catch (Exception e) {
+                    log.error("Error evaluating alerts for transaction {}: {}",
+                        transaction.getTxId(), e.getMessage(), e);
+                    // Continue processing other transactions
+                }
+            }
+        }
+
+        // Dispatch all notifications asynchronously
+        if (!allNotifications.isEmpty()) {
+            log.info("Dispatching {} notifications from {} blocks", allNotifications.size(), count);
+            notificationDispatcher.dispatchBatch(allNotifications);
         }
 
         return count;
