@@ -43,7 +43,7 @@ public class SecurityConfiguration {
                         // Public endpoints
                         .requestMatchers(
                                 "/api/v1/auth/**",
-                                "/api/v1/webhook/chainhook",
+                                "/api/v1/webhook/**",
                                 "/actuator/**",
                                 "/swagger-ui/**",
                                 "/api-docs/**",
