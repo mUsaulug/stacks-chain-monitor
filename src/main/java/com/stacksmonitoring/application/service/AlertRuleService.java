@@ -30,9 +30,9 @@ public class AlertRuleService {
      * Create a new alert rule.
      */
     @Transactional
-    public AlertRule createRule(CreateAlertRuleRequest request, String username) {
-        User user = userRepository.findByUsername(username)
-                .orElseThrow(() -> new RuntimeException("User not found: " + username));
+    public AlertRule createRule(CreateAlertRuleRequest request, String email) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("User not found: " + email));
 
         AlertRule rule = switch (request.getRuleType()) {
             case CONTRACT_CALL -> createContractCallRule(request);
@@ -57,7 +57,7 @@ public class AlertRuleService {
         // Invalidate cache
         alertMatchingService.invalidateRulesCache();
 
-        log.info("Created alert rule {} for user {}", savedRule.getId(), username);
+        log.info("Created alert rule {} for user {}", savedRule.getId(), email);
 
         return savedRule;
     }
@@ -101,9 +101,9 @@ public class AlertRuleService {
     /**
      * Get all rules for a user.
      */
-    public List<AlertRule> getUserRules(String username) {
-        User user = userRepository.findByUsername(username)
-                .orElseThrow(() -> new RuntimeException("User not found: " + username));
+    public List<AlertRule> getUserRules(String email) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("User not found: " + email));
 
         return alertRuleRepository.findByUserId(user.getId());
     }
@@ -111,9 +111,9 @@ public class AlertRuleService {
     /**
      * Get active rules for a user.
      */
-    public List<AlertRule> getActiveUserRules(String username) {
-        User user = userRepository.findByUsername(username)
-                .orElseThrow(() -> new RuntimeException("User not found: " + username));
+    public List<AlertRule> getActiveUserRules(String email) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new RuntimeException("User not found: " + email));
 
         return alertRuleRepository.findActiveByUserId(user.getId());
     }
