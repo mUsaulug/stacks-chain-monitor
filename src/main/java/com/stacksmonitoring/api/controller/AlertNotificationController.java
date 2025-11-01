@@ -41,7 +41,7 @@ public class AlertNotificationController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size) {
 
-        User user = userRepository.findByUsername(authentication.getName())
+        User user = userRepository.findByEmail(authentication.getName())
                 .orElseThrow(() -> new RuntimeException("User not found"));
 
         Pageable pageable = PageRequest.of(page, size);
@@ -62,7 +62,7 @@ public class AlertNotificationController {
             @RequestParam(defaultValue = "0") int page,
             @RequestParam(defaultValue = "20") int size) {
 
-        User user = userRepository.findByUsername(authentication.getName())
+        User user = userRepository.findByEmail(authentication.getName())
                 .orElseThrow(() -> new RuntimeException("User not found"));
 
         Pageable pageable = PageRequest.of(page, size);
@@ -79,7 +79,7 @@ public class AlertNotificationController {
      */
     @GetMapping("/stats")
     public ResponseEntity<Map<String, Object>> getNotificationStats(Authentication authentication) {
-        User user = userRepository.findByUsername(authentication.getName())
+        User user = userRepository.findByEmail(authentication.getName())
                 .orElseThrow(() -> new RuntimeException("User not found"));
 
         Map<String, Object> stats = new HashMap<>();
