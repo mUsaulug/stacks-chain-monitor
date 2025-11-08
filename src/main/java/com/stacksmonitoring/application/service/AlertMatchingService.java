@@ -1,12 +1,13 @@
 package com.stacksmonitoring.application.service;
 
+import com.stacksmonitoring.application.dto.RuleIndex;
+import com.stacksmonitoring.application.dto.RuleSnapshot;
 import com.stacksmonitoring.domain.model.blockchain.ContractCall;
+import com.stacksmonitoring.domain.model.blockchain.FungibleTokenTransferEvent;
 import com.stacksmonitoring.domain.model.blockchain.StacksTransaction;
 import com.stacksmonitoring.domain.model.blockchain.TransactionEvent;
 import com.stacksmonitoring.domain.model.monitoring.AlertNotification;
 import com.stacksmonitoring.domain.model.monitoring.AlertRule;
-import com.stacksmonitoring.domain.model.monitoring.ContractCallAlertRule;
-import com.stacksmonitoring.domain.model.monitoring.TokenTransferAlertRule;
 import com.stacksmonitoring.domain.repository.AlertNotificationRepository;
 import com.stacksmonitoring.domain.repository.AlertRuleRepository;
 import com.stacksmonitoring.domain.valueobject.AlertRuleType;
@@ -22,13 +23,19 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
  * Service for matching transactions and events against alert rules.
- * Implements cache-optimized alert matching for high performance.
+ * Implements O(1) alert matching using immutable multi-level index.
  *
- * Performance: O(1) lookup via cached rule maps by type.
+ * Performance Improvements (P1-1 + P1-3):
+ * - Immutable DTO caching (thread-safe, no staleness)
+ * - Multi-level index (contract + function + asset)
+ * - O(1) candidate lookup (vs O(k) full scan)
+ *
+ * Reference: CLAUDE.md P1-1, P1-3
  */
 @Service
 @RequiredArgsConstructor
@@ -73,18 +80,27 @@ public class AlertMatchingService {
     }
 
     /**
-     * Evaluate contract call alerts.
+     * Evaluate contract call alerts using O(1) index lookup.
+     * BEFORE (P1-3): O(k) loop through all CONTRACT_CALL rules
+     * AFTER: O(1) index lookup by contract + function
      */
     private List<AlertNotification> evaluateContractCall(StacksTransaction transaction, ContractCall contractCall) {
         List<AlertNotification> notifications = new ArrayList<>();
 
-        // Get all active contract call rules (cached)
-        List<AlertRule> rules = getActiveRulesByType(AlertRuleType.CONTRACT_CALL);
+        // O(1) candidate lookup using multi-level index
+        RuleIndex index = getRuleIndex();
+        List<RuleSnapshot> candidates = index.getCandidatesForContractCall(
+            contractCall.getContractIdentifier(),
+            contractCall.getFunctionName()
+        );
 
-        for (AlertRule rule : rules) {
-            if (rule instanceof ContractCallAlertRule) {
+        log.debug("Contract call {} → {} candidates (O(1) lookup)",
+            contractCall.getContractIdentifier(), candidates.size());
+
+        for (RuleSnapshot snapshot : candidates) {
+            if (snapshot.matches(contractCall)) {
                 // Use atomic DB-level check-and-trigger to prevent race conditions
-                notifications.addAll(createNotificationsIfAllowed(rule, transaction, null, contractCall));
+                notifications.addAll(createNotificationsFromSnapshot(snapshot, transaction, null, contractCall));
             }
         }
 
@@ -92,116 +108,124 @@ public class AlertMatchingService {
     }
 
     /**
-     * Evaluate event-based alerts (token transfers, NFT transfers, etc.).
+     * Evaluate event-based alerts using O(1) index lookup.
+     * BEFORE: O(k) loop through all TOKEN_TRANSFER rules
+     * AFTER: O(1) index lookup by asset identifier
      */
     private List<AlertNotification> evaluateEvent(StacksTransaction transaction, TransactionEvent event) {
         List<AlertNotification> notifications = new ArrayList<>();
 
-        // Get all active token transfer rules (cached)
-        List<AlertRule> rules = getActiveRulesByType(AlertRuleType.TOKEN_TRANSFER);
+        // Token transfer events - O(1) lookup by asset
+        if (event instanceof FungibleTokenTransferEvent ftEvent) {
+            RuleIndex index = getRuleIndex();
+            List<RuleSnapshot> candidates = index.getCandidatesForTokenTransfer(
+                ftEvent.getAssetIdentifier()
+            );
 
-        for (AlertRule rule : rules) {
-            if (rule instanceof TokenTransferAlertRule) {
-                // Use atomic DB-level check-and-trigger to prevent race conditions
-                notifications.addAll(createNotificationsIfAllowed(rule, transaction, event, event));
+            log.debug("Token transfer {} → {} candidates (O(1) lookup)",
+                ftEvent.getAssetIdentifier(), candidates.size());
+
+            for (RuleSnapshot snapshot : candidates) {
+                if (snapshot.matches(event)) {
+                    notifications.addAll(createNotificationsFromSnapshot(snapshot, transaction, event, event));
+                }
             }
         }
 
-        // Check for print event alerts
+        // Check for print event alerts (fallback to type-based for now)
         notifications.addAll(evaluatePrintEvent(transaction, event));
 
         return notifications;
     }
 
     /**
-     * Evaluate print event alerts.
+     * Evaluate print event alerts (type-based, no specialized index yet).
      */
     private List<AlertNotification> evaluatePrintEvent(StacksTransaction transaction, TransactionEvent event) {
         List<AlertNotification> notifications = new ArrayList<>();
 
-        // Get all active print event rules (cached)
-        List<AlertRule> rules = getActiveRulesByType(AlertRuleType.PRINT_EVENT);
+        // Fallback to type-based lookup (could be optimized with contract-based index)
+        RuleIndex index = getRuleIndex();
+        List<RuleSnapshot> candidates = index.getByType(AlertRuleType.PRINT_EVENT);
 
-        for (AlertRule rule : rules) {
-            // Use atomic DB-level check-and-trigger to prevent race conditions
-            notifications.addAll(createNotificationsIfAllowed(rule, transaction, event, event));
+        for (RuleSnapshot snapshot : candidates) {
+            if (snapshot.matches(event)) {
+                notifications.addAll(createNotificationsFromSnapshot(snapshot, transaction, event, event));
+            }
         }
 
         return notifications;
     }
 
     /**
-     * Evaluate failed transaction alerts.
+     * Evaluate failed transaction alerts (type-based).
      */
     private List<AlertNotification> evaluateFailedTransaction(StacksTransaction transaction) {
         List<AlertNotification> notifications = new ArrayList<>();
 
-        // Get all active failed transaction rules (cached)
-        List<AlertRule> rules = getActiveRulesByType(AlertRuleType.FAILED_TRANSACTION);
+        // Type-based lookup (no specialized index needed - rare event)
+        RuleIndex index = getRuleIndex();
+        List<RuleSnapshot> candidates = index.getByType(AlertRuleType.FAILED_TRANSACTION);
 
-        for (AlertRule rule : rules) {
-            // Use atomic DB-level check-and-trigger to prevent race conditions
-            notifications.addAll(createNotificationsIfAllowed(rule, transaction, null, transaction));
+        for (RuleSnapshot snapshot : candidates) {
+            if (snapshot.matches(transaction)) {
+                notifications.addAll(createNotificationsFromSnapshot(snapshot, transaction, null, transaction));
+            }
         }
 
         return notifications;
     }
 
     /**
-     * Create notifications if rule is allowed to trigger (atomic check-and-trigger).
-     * This method prevents race conditions by using database-level conditional UPDATE.
+     * Create notifications from immutable snapshot (atomic check-and-trigger).
+     * Works with RuleSnapshot instead of mutable entity.
      *
      * Flow:
-     * 1. Check if rule matches the context (business logic)
+     * 1. Rule already matched (called from index lookup)
      * 2. Atomically try to mark rule as triggered (DB-level cooldown check)
      * 3. Only create notifications if atomic UPDATE succeeded
      *
-     * @param rule Alert rule to evaluate
+     * @param snapshot Immutable rule snapshot
      * @param transaction Transaction that triggered the alert
      * @param event Optional event that triggered the alert
-     * @param context Context object for rule matching (contractCall, event, or transaction)
-     * @return List of created notifications (empty if cooldown active or no match)
+     * @param context Context object for notification message
+     * @return List of created notifications (empty if cooldown active)
      */
-    private List<AlertNotification> createNotificationsIfAllowed(
-            AlertRule rule,
+    private List<AlertNotification> createNotificationsFromSnapshot(
+            RuleSnapshot snapshot,
             StacksTransaction transaction,
             TransactionEvent event,
             Object context) {
 
-        // Step 1: Check if rule matches the context (business logic)
-        boolean matches;
-        try {
-            matches = rule.matches(context);
-        } catch (Exception e) {
-            log.error("Error evaluating rule {}: {}", rule.getId(), e.getMessage(), e);
-            return List.of(); // Empty list if evaluation fails
-        }
-
-        if (!matches) {
-            return List.of(); // Rule doesn't match, no notifications
-        }
-
-        // Step 2: Atomically try to mark rule as triggered (DB-level cooldown check)
+        // Step 1: Atomically try to mark rule as triggered (DB-level cooldown check)
         Instant now = Instant.now();
-        Instant windowStart = now.minusSeconds(rule.getCooldownMinutes() * 60L);
+        Instant windowStart = snapshot.getCooldownWindowStart();
 
         int updated = alertRuleRepository.markTriggeredIfOutOfCooldown(
-            rule.getId(),
+            snapshot.id(),
             now,
             windowStart
         );
 
-        // Step 3: Only create notifications if atomic UPDATE succeeded
+        // Step 2: Only create notifications if atomic UPDATE succeeded
         if (updated == 0) {
-            log.debug("Rule {} is in cooldown, skipping notification", rule.getId());
+            log.debug("Rule {} is in cooldown, skipping notification", snapshot.id());
             return List.of(); // Cooldown active, no notifications
         }
 
-        // Rule triggered successfully, create notifications
+        // Step 3: Rule triggered successfully, create notifications
         List<AlertNotification> notifications = new ArrayList<>();
+
+        // Load full entity for notification (need @ManyToOne relationships)
+        AlertRule rule = alertRuleRepository.findById(snapshot.id()).orElse(null);
+        if (rule == null) {
+            log.warn("Rule {} not found (deleted?), skipping notification", snapshot.id());
+            return List.of();
+        }
+
         String triggerDescription = rule.getTriggerDescription(context);
 
-        for (NotificationChannel channel : rule.getNotificationChannels()) {
+        for (NotificationChannel channel : snapshot.channels()) {
             AlertNotification notification = new AlertNotification();
             notification.setAlertRule(rule);
             notification.setTransaction(transaction);
@@ -216,13 +240,12 @@ public class AlertMatchingService {
                 notifications.add(notification);
 
                 log.info("Created {} notification for rule {} ({})",
-                    channel, rule.getId(), rule.getRuleName());
+                    channel, snapshot.id(), snapshot.ruleName());
 
             } catch (DataIntegrityViolationException e) {
                 // Duplicate notification detected (webhook arrived multiple times)
-                // This is expected behavior with idempotency constraint
                 log.debug("Duplicate notification detected for rule {} (tx: {}, channel: {}), skipping",
-                    rule.getId(), transaction.getTxId(), channel);
+                    snapshot.id(), transaction.getTxId(), channel);
             }
         }
 
@@ -262,47 +285,61 @@ public class AlertMatchingService {
     }
 
     /**
-     * Get active rules by type (cached for performance).
-     * Cache key: alertRuleType
+     * Get immutable rule index (cached for performance).
      *
-     * This provides O(1) lookup for alert matching.
+     * BEFORE (P1-1): Cached mutable entities
+     * - Thread safety issues
+     * - Stale data (lastTriggeredAt changes)
+     * - Redis serialization failures
+     *
+     * AFTER: Cached immutable DTOs
+     * - Thread-safe (all fields final)
+     * - No staleness (index rebuilt on invalidation)
+     * - Serializable for Redis
+     *
+     * Cache Key: "ruleIndex" (single index for all rules)
+     * TTL: 10 minutes (configured in application.yml)
      */
-    @Cacheable(value = "alertRules", key = "#ruleType")
-    public List<AlertRule> getActiveRulesByType(AlertRuleType ruleType) {
-        log.debug("Loading active rules for type: {}", ruleType);
-        return alertRuleRepository.findActiveByRuleType(ruleType);
+    @Cacheable(value = "alertRules", key = "'ruleIndex'")
+    public RuleIndex getRuleIndex() {
+        log.info("Building immutable rule index from database");
+        List<AlertRule> activeRules = alertRuleRepository.findAllActive();
+        RuleIndex index = RuleIndex.from(activeRules);
+
+        log.info("Built rule index: {} total rules, {} contract/function combos",
+            index.getStats().totalRules(),
+            index.getStats().contractFunctionCombos());
+
+        return index;
     }
 
     /**
-     * Get all active alert rules (cached).
-     */
-    @Cacheable(value = "alertRules", key = "'all'")
-    public List<AlertRule> getAllActiveRules() {
-        log.debug("Loading all active rules");
-        return alertRuleRepository.findAllActive();
-    }
-
-    /**
-     * Invalidate alert rules cache.
+     * Invalidate rule index cache.
      * Call this when rules are created, updated, or deleted.
      */
     @CacheEvict(value = "alertRules", allEntries = true)
-    public void invalidateRulesCache() {
-        log.info("Invalidated alert rules cache");
+    public void invalidateRuleIndex() {
+        log.info("Invalidated immutable rule index cache");
     }
 
     /**
      * Get statistics about alert matching.
+     * Uses cached index for fast stats.
      */
     public AlertMatchingStats getStats() {
-        AlertMatchingStats stats = new AlertMatchingStats();
+        RuleIndex index = getRuleIndex();
+        RuleIndex.IndexStats indexStats = index.getStats();
 
-        stats.totalActiveRules = alertRuleRepository.findAllActive().size();
-        stats.rulesByType = alertRuleRepository.findAllActive().stream()
-            .collect(Collectors.groupingBy(
-                AlertRule::getRuleType,
-                Collectors.counting()
+        AlertMatchingStats stats = new AlertMatchingStats();
+        stats.totalActiveRules = indexStats.totalRules();
+        stats.rulesByType = index.byType().entrySet().stream()
+            .collect(Collectors.toMap(
+                Map.Entry::getKey,
+                e -> (long) e.getValue().size()
             ));
+        stats.contractsIndexed = indexStats.contractsIndexed();
+        stats.assetsIndexed = indexStats.assetsIndexed();
+        stats.indexCreatedAt = index.createdAt();
 
         return stats;
     }
@@ -312,6 +349,9 @@ public class AlertMatchingService {
      */
     public static class AlertMatchingStats {
         public long totalActiveRules;
-        public java.util.Map<AlertRuleType, Long> rulesByType;
+        public Map<AlertRuleType, Long> rulesByType;
+        public int contractsIndexed;
+        public int assetsIndexed;
+        public Instant indexCreatedAt;
     }
 }
