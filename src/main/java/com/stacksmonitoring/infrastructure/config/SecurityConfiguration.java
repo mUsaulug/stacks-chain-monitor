@@ -20,6 +20,13 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 /**
  * Spring Security configuration for JWT-based authentication.
  * Configures security filter chain, authentication providers, and password encoding.
+ *
+ * Filter Execution Order (CRITICAL for security):
+ * 1. ChainhookHmacFilter - Validates webhook HMAC signatures
+ * 2. JwtAuthenticationFilter - Extracts JWT, populates SecurityContext
+ * 3. RateLimitFilter - Enforces per-user rate limits (needs SecurityContext)
+ *
+ * Reference: CLAUDE.md P0-3 (Security Filter Ordering)
  */
 @Configuration
 @EnableWebSecurity
@@ -40,15 +47,18 @@ public class SecurityConfiguration {
         http
                 .csrf(AbstractHttpConfigurer::disable)
                 .authorizeHttpRequests(auth -> auth
-                        // Public endpoints
+                        // Public endpoints (authentication not required)
                         .requestMatchers(
                                 "/api/v1/auth/**",
                                 "/api/v1/webhook/**",
-                                "/actuator/**",
+                                "/actuator/health",
+                                "/actuator/info",
                                 "/swagger-ui/**",
                                 "/api-docs/**",
                                 "/v3/api-docs/**"
                         ).permitAll()
+                        // Actuator endpoints require ADMIN role
+                        .requestMatchers("/actuator/**").hasRole("ADMIN")
                         // All other endpoints require authentication
                         .anyRequest().authenticated()
                 )
@@ -56,10 +66,13 @@ public class SecurityConfiguration {
                         .sessionCreationPolicy(SessionCreationPolicy.STATELESS)
                 )
                 .authenticationProvider(authenticationProvider())
-                // Add filters in correct order
-                .addFilterBefore(rateLimitFilter, UsernamePasswordAuthenticationFilter.class)
+                // CRITICAL: Filter order matters for security!
+                // 1. HMAC validation (webhook signature check)
                 .addFilterBefore(chainhookHmacFilter, UsernamePasswordAuthenticationFilter.class)
-                .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+                // 2. JWT authentication (populate SecurityContext with user identity)
+                .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
+                // 3. Rate limiting (AFTER authentication - needs SecurityContext for per-user limits)
+                .addFilterAfter(rateLimitFilter, JwtAuthenticationFilter.class);
 
         return http.build();
     }
