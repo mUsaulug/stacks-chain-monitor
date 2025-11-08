@@ -30,6 +30,9 @@ public class TransactionMetadataDto {
     @JsonProperty("fee")
     private Long fee;
 
+    @JsonProperty("nonce")
+    private Long nonce;
+
     @JsonProperty("kind")
     private TransactionKindDto kind;
 

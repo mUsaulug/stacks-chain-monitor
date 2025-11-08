@@ -94,8 +94,12 @@ public class ChainhookPayloadParser {
                 transaction.setTxIndex(0);
             }
 
-            // Nonce (default to 0 if not available)
-            transaction.setNonce(0L);
+            // Nonce (parse from metadata)
+            if (metadata.getNonce() != null) {
+                transaction.setNonce(metadata.getNonce());
+            } else {
+                transaction.setNonce(0L);
+            }
 
             // Execution cost
             if (metadata.getExecutionCost() != null) {
@@ -232,34 +236,38 @@ public class ChainhookPayloadParser {
 
     /**
      * Parse a single event DTO to appropriate TransactionEvent subtype.
+     * Uses type-safe enum parsing to prevent runtime typos.
      */
     private TransactionEvent parseEvent(EventDto eventDto, StacksTransaction transaction, int index) {
-        String eventType = eventDto.getType();
-        if (eventType == null) {
+        String eventTypeString = eventDto.getType();
+        if (eventTypeString == null) {
             log.warn("Event type is null, skipping event at index {}", index);
             return null;
         }
 
         Map<String, Object> data = eventDto.getData();
         if (data == null) {
-            log.warn("Event data is null for type {}, skipping", eventType);
+            log.warn("Event data is null for type {}, skipping", eventTypeString);
             return null;
         }
 
-        TransactionEvent event = switch (eventType.toUpperCase()) {
-            case "FT_TRANSFER_EVENT", "FT_TRANSFER" -> parseFTTransferEvent(data);
-            case "FT_MINT_EVENT", "FT_MINT" -> parseFTMintEvent(data);
-            case "FT_BURN_EVENT", "FT_BURN" -> parseFTBurnEvent(data);
-            case "NFT_TRANSFER_EVENT", "NFT_TRANSFER" -> parseNFTTransferEvent(data);
-            case "NFT_MINT_EVENT", "NFT_MINT" -> parseNFTMintEvent(data);
-            case "NFT_BURN_EVENT", "NFT_BURN" -> parseNFTBurnEvent(data);
-            case "STX_TRANSFER_EVENT", "STX_TRANSFER" -> parseSTXTransferEvent(data);
-            case "STX_MINT_EVENT", "STX_MINT" -> parseSTXMintEvent(data);
-            case "STX_BURN_EVENT", "STX_BURN" -> parseSTXBurnEvent(data);
-            case "STX_LOCK_EVENT", "STX_LOCK" -> parseSTXLockEvent(data);
-            case "SMART_CONTRACT_LOG", "PRINT_EVENT" -> parseSmartContractEvent(data);
-            default -> {
-                log.warn("Unknown event type: {}", eventType);
+        // Type-safe parsing: wire format → enum
+        EventType eventType = EventType.fromWireFormat(eventTypeString);
+
+        TransactionEvent event = switch (eventType) {
+            case FT_TRANSFER -> parseFTTransferEvent(data);
+            case FT_MINT -> parseFTMintEvent(data);
+            case FT_BURN -> parseFTBurnEvent(data);
+            case NFT_TRANSFER -> parseNFTTransferEvent(data);
+            case NFT_MINT -> parseNFTMintEvent(data);
+            case NFT_BURN -> parseNFTBurnEvent(data);
+            case STX_TRANSFER -> parseSTXTransferEvent(data);
+            case STX_MINT -> parseSTXMintEvent(data);
+            case STX_BURN -> parseSTXBurnEvent(data);
+            case STX_LOCK -> parseSTXLockEvent(data);
+            case SMART_CONTRACT_EVENT -> parseSmartContractEvent(data);
+            case UNKNOWN -> {
+                log.warn("Unknown event type: {}", eventTypeString);
                 yield null;
             }
         };
