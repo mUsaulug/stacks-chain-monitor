@@ -52,7 +52,7 @@ public interface ChainhookMapper {
     @Mapping(target = "sender", source = "metadata.sender")
     @Mapping(target = "success", source = "metadata.success", defaultValue = "false")
     @Mapping(target = "sponsorAddress", source = "metadata.sponsor")
-    @Mapping(target = "feeRate", source = "metadata.fee", qualifiedByName = "longToBigDecimal")
+    @Mapping(target = "feeMicroStx", source = "metadata.fee", qualifiedByName = "stringToBigInteger")
     @Mapping(target = "txIndex", source = "metadata.position.index", defaultValue = "0")
     @Mapping(target = "nonce", source = "metadata.nonce", defaultValue = "0L")
     @Mapping(target = "executionCostReadCount", source = "metadata.executionCost.readCount")
@@ -166,11 +166,17 @@ public interface ChainhookMapper {
     }
 
     /**
-     * Convert Long to BigDecimal.
+     * Convert string to BigInteger (for fee amounts).
+     * Prevents precision loss with very large numbers.
      */
-    @Named("longToBigDecimal")
-    default BigDecimal longToBigDecimal(Long value) {
-        return value != null ? BigDecimal.valueOf(value) : null;
+    @Named("stringToBigInteger")
+    default BigInteger stringToBigInteger(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            return new BigInteger(value);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**

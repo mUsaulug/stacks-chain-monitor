@@ -27,8 +27,12 @@ public class TransactionMetadataDto {
     @JsonProperty("sender")
     private String sender;
 
+    /**
+     * Fee in microSTX (1 STX = 1,000,000 microSTX).
+     * String to avoid precision loss with large numbers.
+     */
     @JsonProperty("fee")
-    private Long fee;
+    private String fee;
 
     @JsonProperty("nonce")
     private Long nonce;
