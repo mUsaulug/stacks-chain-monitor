@@ -15,6 +15,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -209,12 +210,20 @@ public class AlertMatchingService {
             notification.setTriggeredAt(now);
             notification.setMessage(buildNotificationMessage(rule, transaction, triggerDescription));
 
-            // Save notification
-            alertNotificationRepository.save(notification);
-            notifications.add(notification);
+            // Save notification with idempotency (unique constraint prevents duplicates)
+            try {
+                alertNotificationRepository.save(notification);
+                notifications.add(notification);
 
-            log.info("Created {} notification for rule {} ({})",
-                channel, rule.getId(), rule.getRuleName());
+                log.info("Created {} notification for rule {} ({})",
+                    channel, rule.getId(), rule.getRuleName());
+
+            } catch (DataIntegrityViolationException e) {
+                // Duplicate notification detected (webhook arrived multiple times)
+                // This is expected behavior with idempotency constraint
+                log.debug("Duplicate notification detected for rule {} (tx: {}, channel: {}), skipping",
+                    rule.getId(), transaction.getTxId(), channel);
+            }
         }
 
         return notifications;
