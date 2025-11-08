@@ -1,5 +1,6 @@
 package com.stacksmonitoring.application.service;
 
+import com.stacksmonitoring.application.event.NotificationsReadyEvent;
 import com.stacksmonitoring.domain.model.monitoring.AlertNotification;
 import com.stacksmonitoring.domain.repository.AlertNotificationRepository;
 import com.stacksmonitoring.domain.valueobject.NotificationStatus;
@@ -8,12 +9,29 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
 
 import java.util.List;
 
 /**
  * Dispatcher for alert notifications.
  * Coordinates multiple notification services and handles delivery.
+ *
+ * CRITICAL: Transaction-Bound Event Listener (P0-6)
+ * - Listens to NotificationsReadyEvent with @TransactionalEventListener(AFTER_COMMIT)
+ * - Notifications dispatched ONLY if database commit succeeds
+ * - Zero phantom notifications on rollback
+ * - Prevents sending emails/webhooks before data is persisted
+ *
+ * Flow:
+ * 1. ProcessChainhookPayloadUseCase publishes NotificationsReadyEvent (inside @Transactional)
+ * 2. Spring delays event processing until AFTER_COMMIT phase
+ * 3. If commit succeeds → handleNotificationsReady() called → notifications sent
+ * 4. If commit fails/rollback → event listener never called → no phantom notifications
+ *
+ * Reference: CLAUDE.md P0-6 (AFTER_COMMIT Notification Dispatch)
+ * Spring Docs: https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html
  */
 @Service
 @RequiredArgsConstructor
@@ -67,7 +85,30 @@ public class NotificationDispatcher {
     }
 
     /**
+     * Listen for NotificationsReadyEvent and dispatch notifications AFTER commit.
+     * This method is called ONLY if the transaction commits successfully.
+     *
+     * Critical: Prevents phantom notifications
+     * - Event published inside @Transactional method
+     * - Listener waits for AFTER_COMMIT phase
+     * - If commit fails, listener never called
+     * - Emails/webhooks sent only if data persisted
+     *
+     * @param event NotificationsReadyEvent containing list of notifications
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    @Async
+    public void handleNotificationsReady(NotificationsReadyEvent event) {
+        List<AlertNotification> notifications = event.getNotifications();
+        log.info("Transaction committed successfully - dispatching {} notifications",
+                notifications.size());
+
+        dispatchBatch(notifications);
+    }
+
+    /**
      * Dispatch multiple notifications (batch processing).
+     * Can be called directly or via event listener.
      */
     @Async
     public void dispatchBatch(List<AlertNotification> notifications) {

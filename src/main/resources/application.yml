@@ -52,16 +52,35 @@ spring:
     locations: classpath:db/migration
     validate-on-migrate: true
 
-  # Cache Configuration (MVP: Simple, Production: Redis)
+  # Redis Configuration (distributed caching and rate limiting)
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: ${REDIS_DATABASE:0}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 2
+          max-wait: -1ms
+        shutdown-timeout: 100ms
+
+  # Cache Configuration (Redis for production, Simple for local dev)
   cache:
-    type: simple
+    type: ${CACHE_TYPE:simple}
     cache-names:
       - alertRules
       - activeUsers
       - monitoredContracts
     simple:
-      # Cache entries expire after 10 minutes
+      # Cache entries expire after 10 minutes (local dev only)
       spec: maximumSize=1000,expireAfterWrite=600s
+    redis:
+      # Redis cache TTL (production)
+      time-to-live: 600000 # 10 minutes
 
   # Mail Configuration (SMTP)
   mail:
@@ -118,6 +137,10 @@ stacks:
     webhook:
       hmac-secret: ${CHAINHOOK_HMAC_SECRET:change-me-in-production}
       enabled: true
+      # Replay attack protection (timestamp validation)
+      # Requires client to include X-Signature-Timestamp header
+      # HMAC calculated as: hmac(secret, timestamp + "." + body)
+      replay-protection: ${CHAINHOOK_REPLAY_PROTECTION:true}
 
     # Alert engine configuration
     alert:

@@ -3,8 +3,8 @@ package com.stacksmonitoring.application.usecase;
 import com.stacksmonitoring.api.dto.webhook.BlockEventDto;
 import com.stacksmonitoring.api.dto.webhook.ChainhookPayloadDto;
 import com.stacksmonitoring.api.dto.webhook.TransactionDto;
+import com.stacksmonitoring.application.event.NotificationsReadyEvent;
 import com.stacksmonitoring.application.service.AlertMatchingService;
-import com.stacksmonitoring.application.service.NotificationDispatcher;
 import com.stacksmonitoring.domain.model.blockchain.StacksBlock;
 import com.stacksmonitoring.domain.model.blockchain.StacksTransaction;
 import com.stacksmonitoring.domain.model.monitoring.AlertNotification;
@@ -12,6 +12,7 @@ import com.stacksmonitoring.domain.repository.StacksBlockRepository;
 import com.stacksmonitoring.infrastructure.parser.ChainhookPayloadParser;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -25,6 +26,14 @@ import java.util.Optional;
  * Handles both apply (new blocks) and rollback (blockchain reorganization) events.
  * Implements batch processing for optimal database performance.
  * Evaluates alert rules and triggers notifications after persisting transactions.
+ *
+ * CRITICAL: Notification Dispatch Timing (P0-6)
+ * - Notifications are published as events INSIDE transaction
+ * - NotificationDispatcher listens with @TransactionalEventListener(AFTER_COMMIT)
+ * - Emails/webhooks sent ONLY if database commit succeeds
+ * - Zero phantom notifications on rollback
+ *
+ * Reference: CLAUDE.md P0-6 (AFTER_COMMIT Notification Dispatch)
  */
 @Service
 @RequiredArgsConstructor
@@ -34,7 +43,7 @@ public class ProcessChainhookPayloadUseCase {
     private final ChainhookPayloadParser parser;
     private final StacksBlockRepository blockRepository;
     private final AlertMatchingService alertMatchingService;
-    private final NotificationDispatcher notificationDispatcher;
+    private final ApplicationEventPublisher eventPublisher;
 
     /**
      * Process a complete Chainhook webhook payload.
@@ -179,10 +188,11 @@ public class ProcessChainhookPayloadUseCase {
             }
         }
 
-        // Dispatch all notifications asynchronously
+        // Publish notifications as event (dispatched AFTER commit succeeds)
         if (!allNotifications.isEmpty()) {
-            log.info("Dispatching {} notifications from {} blocks", allNotifications.size(), count);
-            notificationDispatcher.dispatchBatch(allNotifications);
+            log.info("Publishing event for {} notifications from {} blocks (dispatch after commit)",
+                    allNotifications.size(), count);
+            eventPublisher.publishEvent(new NotificationsReadyEvent(this, allNotifications));
         }
 
         return count;

@@ -1,7 +1,9 @@
 package com.stacksmonitoring.infrastructure.config;
 
+import com.stacksmonitoring.application.service.TokenRevocationService;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
@@ -19,6 +21,15 @@ import java.io.IOException;
 /**
  * JWT Authentication Filter for validating JWT tokens in request headers.
  * Extracts and validates JWT token from Authorization header (Bearer scheme).
+ *
+ * Security Validations (OWASP JWT Cheat Sheet):
+ * 1. Signature validation (RS256 public key)
+ * 2. Expiration check
+ * 3. Issuer validation
+ * 4. Token revocation check (denylist)
+ * 5. Fingerprint validation (cookie binding)
+ *
+ * Reference: CLAUDE.md P0-1 (JWT RS256 Migration)
  */
 @Slf4j
 @Component
@@ -27,6 +38,9 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     private final JwtTokenService jwtTokenService;
     private final CustomUserDetailsService userDetailsService;
+    private final TokenRevocationService tokenRevocationService;
+
+    private static final String FINGERPRINT_COOKIE_NAME = "X-Fingerprint";
 
     @Override
     protected void doFilterInternal(
@@ -46,6 +60,21 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             // Extract JWT token
             final String jwt = authHeader.substring(7);
             final String userEmail = jwtTokenService.extractUsername(jwt);
+
+            // CRITICAL: Check if token is revoked (logout, security breach, etc.)
+            if (tokenRevocationService.isTokenRevoked(jwt)) {
+                log.warn("Revoked token attempted for user: {}", userEmail);
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Token has been revoked");
+                return;
+            }
+
+            // CRITICAL: Validate fingerprint (sidejacking prevention)
+            String fingerprintCookie = extractFingerprintCookie(request);
+            if (fingerprintCookie != null && !jwtTokenService.validateFingerprint(jwt, fingerprintCookie)) {
+                log.warn("Fingerprint mismatch for user: {} - potential token sidejacking", userEmail);
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid token fingerprint");
+                return;
+            }
 
             // Validate token and set authentication
             if (userEmail != null && SecurityContextHolder.getContext().getAuthentication() == null) {
@@ -67,5 +96,21 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         }
 
         filterChain.doFilter(request, response);
+    }
+
+    /**
+     * Extract fingerprint value from HttpOnly cookie.
+     * Used for token sidejacking prevention.
+     */
+    private String extractFingerprintCookie(HttpServletRequest request) {
+        Cookie[] cookies = request.getCookies();
+        if (cookies != null) {
+            for (Cookie cookie : cookies) {
+                if (FINGERPRINT_COOKIE_NAME.equals(cookie.getName())) {
+                    return cookie.getValue();
+                }
+            }
+        }
+        return null;
     }
 }
