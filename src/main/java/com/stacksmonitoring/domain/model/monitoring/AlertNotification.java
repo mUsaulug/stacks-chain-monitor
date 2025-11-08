@@ -17,14 +17,25 @@ import java.time.Instant;
 /**
  * Represents a notification sent when an alert rule is triggered.
  * Tracks delivery status and failure reasons for retry logic.
+ *
+ * Idempotency: Unique constraint on (alert_rule_id, transaction_id, event_id, channel)
+ * ensures duplicate notifications are prevented even if webhooks arrive multiple times.
  */
 @Entity
-@Table(name = "alert_notification", indexes = {
-    @Index(name = "idx_notification_rule", columnList = "alert_rule_id"),
-    @Index(name = "idx_notification_transaction", columnList = "transaction_id"),
-    @Index(name = "idx_notification_triggered_at", columnList = "triggered_at"),
-    @Index(name = "idx_notification_status", columnList = "status")
-})
+@Table(name = "alert_notification",
+    indexes = {
+        @Index(name = "idx_notification_rule", columnList = "alert_rule_id"),
+        @Index(name = "idx_notification_transaction", columnList = "transaction_id"),
+        @Index(name = "idx_notification_triggered_at", columnList = "triggered_at"),
+        @Index(name = "idx_notification_status", columnList = "status")
+    },
+    uniqueConstraints = {
+        @UniqueConstraint(
+            name = "uk_notification_rule_tx_event_channel",
+            columnNames = {"alert_rule_id", "transaction_id", "event_id", "channel"}
+        )
+    }
+)
 @EntityListeners(AuditingEntityListener.class)
 @Getter
 @Setter
@@ -33,7 +44,8 @@ import java.time.Instant;
 public class AlertNotification {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "alert_notification_seq_gen")
+    @SequenceGenerator(name = "alert_notification_seq_gen", sequenceName = "alert_notification_seq", allocationSize = 50)
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)

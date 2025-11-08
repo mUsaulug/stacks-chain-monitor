@@ -25,7 +25,8 @@ import java.util.Map;
 public class ContractDeployment {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "contract_deployment_seq_gen")
+    @SequenceGenerator(name = "contract_deployment_seq_gen", sequenceName = "contract_deployment_seq", allocationSize = 50)
     private Long id;
 
     @OneToOne(fetch = FetchType.LAZY)

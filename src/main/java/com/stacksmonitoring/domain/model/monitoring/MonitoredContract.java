@@ -37,7 +37,8 @@ import java.util.List;
 public class MonitoredContract {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "monitored_contract_seq_gen")
+    @SequenceGenerator(name = "monitored_contract_seq_gen", sequenceName = "monitored_contract_seq", allocationSize = 50)
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)

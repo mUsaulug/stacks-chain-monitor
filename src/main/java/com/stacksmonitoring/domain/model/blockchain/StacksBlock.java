@@ -30,7 +30,8 @@ import java.util.List;
 public class StacksBlock {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "stacks_block_seq_gen")
+    @SequenceGenerator(name = "stacks_block_seq_gen", sequenceName = "stacks_block_seq", allocationSize = 50)
     private Long id;
 
     @Column(name = "block_height", nullable = false, unique = true)

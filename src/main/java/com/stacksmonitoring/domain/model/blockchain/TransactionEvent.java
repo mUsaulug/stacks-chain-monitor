@@ -6,6 +6,7 @@ import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
+import org.hibernate.annotations.Where;
 import org.springframework.data.annotation.CreatedDate;
 import org.springframework.data.jpa.domain.support.AuditingEntityListener;
 
@@ -15,16 +16,21 @@ import java.time.Instant;
  * Base class for all transaction events in the Stacks blockchain.
  * Uses JOINED inheritance strategy where each subtype has its own table.
  * This is the most critical entity for alert matching - 80% of alert rules operate on events.
+ *
+ * Soft Delete: @Where clause filters out deleted events from all queries.
+ * Critical for blockchain reorgs where events must be marked deleted but preserved for audit.
  */
 @Entity
 @Table(name = "transaction_event", indexes = {
     @Index(name = "idx_event_type", columnList = "event_type"),
     @Index(name = "idx_event_contract", columnList = "event_type, contract_identifier"),
-    @Index(name = "idx_event_transaction", columnList = "transaction_id")
+    @Index(name = "idx_event_transaction", columnList = "transaction_id"),
+    @Index(name = "idx_event_deleted", columnList = "deleted")
 })
 @Inheritance(strategy = InheritanceType.JOINED)
 @DiscriminatorColumn(name = "event_type", discriminatorType = DiscriminatorType.STRING)
 @EntityListeners(AuditingEntityListener.class)
+@Where(clause = "deleted = false")
 @Getter
 @Setter
 @NoArgsConstructor
@@ -32,7 +38,8 @@ import java.time.Instant;
 public abstract class TransactionEvent {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "transaction_event_seq_gen")
+    @SequenceGenerator(name = "transaction_event_seq_gen", sequenceName = "transaction_event_seq", allocationSize = 50)
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)
@@ -48,6 +55,19 @@ public abstract class TransactionEvent {
 
     @Column(name = "contract_identifier", length = 150)
     private String contractIdentifier;
+
+    /**
+     * Soft delete flag for blockchain reorganization handling.
+     * When a block is rolled back, all events are marked as deleted.
+     */
+    @Column(nullable = false)
+    private Boolean deleted = false;
+
+    /**
+     * Timestamp when this event was marked as deleted (blockchain reorg).
+     */
+    @Column(name = "deleted_at")
+    private Instant deletedAt;
 
     @CreatedDate
     @Column(name = "created_at", nullable = false, updatable = false)
@@ -68,6 +88,15 @@ public abstract class TransactionEvent {
     @Override
     public int hashCode() {
         return getClass().hashCode();
+    }
+
+    /**
+     * Mark this event as deleted (soft delete).
+     * Called during blockchain reorganization when the block is rolled back.
+     */
+    public void markAsDeleted() {
+        this.deleted = true;
+        this.deletedAt = Instant.now();
     }
 
     /**

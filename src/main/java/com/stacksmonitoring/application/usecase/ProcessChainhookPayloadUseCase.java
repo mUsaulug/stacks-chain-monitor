@@ -99,15 +99,20 @@ public class ProcessChainhookPayloadUseCase {
                 StacksBlock block = existingBlock.get();
                 block.markAsDeleted();
 
-                // Cascade soft delete to all transactions in the block
+                // Cascade soft delete to all transactions and events in the block
                 block.getTransactions().forEach(tx -> {
                     tx.markAsDeleted();
-                    // Events will be cascade deleted via JPA orphanRemoval
+
+                    // CRITICAL: Propagate soft delete to all events (P1-6 fix)
+                    // Without this, events remain visible even after rollback
+                    if (tx.getEvents() != null && !tx.getEvents().isEmpty()) {
+                        tx.getEvents().forEach(event -> event.markAsDeleted());
+                    }
                 });
 
                 blockRepository.save(block);
                 count++;
-                log.debug("Marked block {} (height {}) as deleted due to rollback",
+                log.debug("Marked block {} (height {}) and all transactions/events as deleted due to rollback",
                     blockHash, block.getBlockHeight());
             } else {
                 log.warn("Rollback requested for non-existent block: {}", blockHash);
