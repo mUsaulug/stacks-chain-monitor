@@ -82,9 +82,8 @@ public class AlertMatchingService {
 
         for (AlertRule rule : rules) {
             if (rule instanceof ContractCallAlertRule) {
-                if (shouldTrigger(rule, contractCall)) {
-                    notifications.addAll(createNotifications(rule, transaction, null));
-                }
+                // Use atomic DB-level check-and-trigger to prevent race conditions
+                notifications.addAll(createNotificationsIfAllowed(rule, transaction, null, contractCall));
             }
         }
 
@@ -102,9 +101,8 @@ public class AlertMatchingService {
 
         for (AlertRule rule : rules) {
             if (rule instanceof TokenTransferAlertRule) {
-                if (shouldTrigger(rule, event)) {
-                    notifications.addAll(createNotifications(rule, transaction, event));
-                }
+                // Use atomic DB-level check-and-trigger to prevent race conditions
+                notifications.addAll(createNotificationsIfAllowed(rule, transaction, event, event));
             }
         }
 
@@ -124,9 +122,8 @@ public class AlertMatchingService {
         List<AlertRule> rules = getActiveRulesByType(AlertRuleType.PRINT_EVENT);
 
         for (AlertRule rule : rules) {
-            if (shouldTrigger(rule, event)) {
-                notifications.addAll(createNotifications(rule, transaction, event));
-            }
+            // Use atomic DB-level check-and-trigger to prevent race conditions
+            notifications.addAll(createNotificationsIfAllowed(rule, transaction, event, event));
         }
 
         return notifications;
@@ -142,57 +139,74 @@ public class AlertMatchingService {
         List<AlertRule> rules = getActiveRulesByType(AlertRuleType.FAILED_TRANSACTION);
 
         for (AlertRule rule : rules) {
-            if (shouldTrigger(rule, transaction)) {
-                notifications.addAll(createNotifications(rule, transaction, null));
-            }
+            // Use atomic DB-level check-and-trigger to prevent race conditions
+            notifications.addAll(createNotificationsIfAllowed(rule, transaction, null, transaction));
         }
 
         return notifications;
     }
 
     /**
-     * Check if a rule should trigger for the given context.
-     * Checks rule matching logic and cooldown period.
+     * Create notifications if rule is allowed to trigger (atomic check-and-trigger).
+     * This method prevents race conditions by using database-level conditional UPDATE.
+     *
+     * Flow:
+     * 1. Check if rule matches the context (business logic)
+     * 2. Atomically try to mark rule as triggered (DB-level cooldown check)
+     * 3. Only create notifications if atomic UPDATE succeeded
+     *
+     * @param rule Alert rule to evaluate
+     * @param transaction Transaction that triggered the alert
+     * @param event Optional event that triggered the alert
+     * @param context Context object for rule matching (contractCall, event, or transaction)
+     * @return List of created notifications (empty if cooldown active or no match)
      */
-    private boolean shouldTrigger(AlertRule rule, Object context) {
-        // Check if rule is in cooldown
-        if (rule.isInCooldown()) {
-            log.debug("Rule {} is in cooldown, skipping", rule.getId());
-            return false;
-        }
-
-        // Check if rule matches context
-        try {
-            return rule.matches(context);
-        } catch (Exception e) {
-            log.error("Error evaluating rule {}: {}", rule.getId(), e.getMessage(), e);
-            return false;
-        }
-    }
-
-    /**
-     * Create notification records for all enabled channels.
-     */
-    private List<AlertNotification> createNotifications(
+    private List<AlertNotification> createNotificationsIfAllowed(
             AlertRule rule,
             StacksTransaction transaction,
-            TransactionEvent event) {
+            TransactionEvent event,
+            Object context) {
 
+        // Step 1: Check if rule matches the context (business logic)
+        boolean matches;
+        try {
+            matches = rule.matches(context);
+        } catch (Exception e) {
+            log.error("Error evaluating rule {}: {}", rule.getId(), e.getMessage(), e);
+            return List.of(); // Empty list if evaluation fails
+        }
+
+        if (!matches) {
+            return List.of(); // Rule doesn't match, no notifications
+        }
+
+        // Step 2: Atomically try to mark rule as triggered (DB-level cooldown check)
+        Instant now = Instant.now();
+        Instant windowStart = now.minusSeconds(rule.getCooldownMinutes() * 60L);
+
+        int updated = alertRuleRepository.markTriggeredIfOutOfCooldown(
+            rule.getId(),
+            now,
+            windowStart
+        );
+
+        // Step 3: Only create notifications if atomic UPDATE succeeded
+        if (updated == 0) {
+            log.debug("Rule {} is in cooldown, skipping notification", rule.getId());
+            return List.of(); // Cooldown active, no notifications
+        }
+
+        // Rule triggered successfully, create notifications
         List<AlertNotification> notifications = new ArrayList<>();
-
-        // Get trigger description
-        Object context = event != null ? event :
-                        (transaction.getContractCall() != null ? transaction.getContractCall() : transaction);
         String triggerDescription = rule.getTriggerDescription(context);
 
-        // Create notification for each enabled channel
         for (NotificationChannel channel : rule.getNotificationChannels()) {
             AlertNotification notification = new AlertNotification();
             notification.setAlertRule(rule);
             notification.setTransaction(transaction);
             notification.setEvent(event);
             notification.setChannel(channel);
-            notification.setTriggeredAt(Instant.now());
+            notification.setTriggeredAt(now);
             notification.setMessage(buildNotificationMessage(rule, transaction, triggerDescription));
 
             // Save notification
@@ -202,10 +216,6 @@ public class AlertMatchingService {
             log.info("Created {} notification for rule {} ({})",
                 channel, rule.getId(), rule.getRuleName());
         }
-
-        // Update rule's last triggered timestamp
-        rule.markAsTriggered();
-        alertRuleRepository.save(rule);
 
         return notifications;
     }
