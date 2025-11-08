@@ -265,6 +265,168 @@ class ChainhookPayloadParserTest {
         assertThat(transaction.getExecutionCostWriteLength()).isEqualTo(500L);
     }
 
+    // ========== P2-2: Nonce Parsing Tests ==========
+
+    @Test
+    void testParseTransaction_WithNonce_ShouldParseCorrectly() {
+        // Given
+        StacksBlock block = new StacksBlock();
+        TransactionDto txDto = createTestTransaction("0xtx123", "SP123", true);
+        txDto.getMetadata().setNonce(42L);
+
+        // When
+        StacksTransaction transaction = parser.parseTransaction(txDto, block);
+
+        // Then
+        assertThat(transaction.getNonce()).isEqualTo(42L);
+    }
+
+    @Test
+    void testParseTransaction_WithoutNonce_ShouldDefaultToZero() {
+        // Given
+        StacksBlock block = new StacksBlock();
+        TransactionDto txDto = createTestTransaction("0xtx456", "SP456", true);
+        txDto.getMetadata().setNonce(null); // Nonce not provided
+
+        // When
+        StacksTransaction transaction = parser.parseTransaction(txDto, block);
+
+        // Then
+        assertThat(transaction.getNonce()).isEqualTo(0L);
+    }
+
+    @Test
+    void testParseTransaction_WithLargeNonce_ShouldHandleCorrectly() {
+        // Given
+        StacksBlock block = new StacksBlock();
+        TransactionDto txDto = createTestTransaction("0xtx789", "SP789", true);
+        txDto.getMetadata().setNonce(999999L);
+
+        // When
+        StacksTransaction transaction = parser.parseTransaction(txDto, block);
+
+        // Then
+        assertThat(transaction.getNonce()).isEqualTo(999999L);
+    }
+
+    // ========== P2-3: BlockMetadataDto New Fields Tests ==========
+
+    @Test
+    void testParseBlock_WithConsensusHash_ShouldParse() {
+        // Given
+        BlockEventDto blockEventDto = createTestBlockEvent(100L, "0xblock", "0xparent", 1234567890L);
+        BlockMetadataDto metadata = new BlockMetadataDto();
+        metadata.setConsensusHash("0x3c4e5f6a7b8c9d0e");
+        blockEventDto.setMetadata(metadata);
+
+        // When
+        StacksBlock block = parser.parseBlock(blockEventDto);
+
+        // Then - consensusHash not yet stored in StacksBlock entity (future enhancement)
+        // This test ensures parsing doesn't fail when field is present
+        assertThat(block).isNotNull();
+        assertThat(block.getBlockHash()).isEqualTo("0xblock");
+    }
+
+    @Test
+    void testParseBlock_WithParentBurnBlockFields_ShouldParse() {
+        // Given
+        BlockEventDto blockEventDto = createTestBlockEvent(100L, "0xblock", "0xparent", 1234567890L);
+        BlockMetadataDto metadata = new BlockMetadataDto();
+        metadata.setParentBurnBlockHash("0xparent_burn");
+        metadata.setParentBurnBlockTime(1234567800L);
+        blockEventDto.setMetadata(metadata);
+
+        // When
+        StacksBlock block = parser.parseBlock(blockEventDto);
+
+        // Then - parent burn block fields not yet stored in entity (future enhancement)
+        // This test ensures parsing doesn't fail when fields are present
+        assertThat(block).isNotNull();
+    }
+
+    @Test
+    void testParseBlock_WithAllNewMetadataFields_ShouldNotFail() {
+        // Given
+        BlockEventDto blockEventDto = createTestBlockEvent(100L, "0xblock", "0xparent", 1234567890L);
+        BlockMetadataDto metadata = new BlockMetadataDto();
+        metadata.setBurnBlockHeight(99L);
+        metadata.setBurnBlockHash("0xburn");
+        metadata.setBurnBlockTime(1234567800L);
+        metadata.setMiner("SP2ABC");
+        metadata.setConsensusHash("0xconsensus");
+        metadata.setParentBurnBlockHash("0xparent_burn");
+        metadata.setParentBurnBlockTime(1234567700L);
+        blockEventDto.setMetadata(metadata);
+
+        // When
+        StacksBlock block = parser.parseBlock(blockEventDto);
+
+        // Then - all fields parse without error
+        assertThat(block).isNotNull();
+        assertThat(block.getBurnBlockHeight()).isEqualTo(99L);
+        assertThat(block.getBurnBlockHash()).isEqualTo("0xburn");
+        assertThat(block.getMinerAddress()).isEqualTo("SP2ABC");
+    }
+
+    // ========== P2-4: Type-Safe Event Parsing Tests ==========
+
+    @Test
+    void testParseEvent_WithEventSuffix_ShouldUseFromWireFormat() {
+        // Given - using "_EVENT" suffix (old format)
+        EventDto eventDto = new EventDto();
+        eventDto.setType("FT_TRANSFER_EVENT");
+        Map<String, Object> data = new HashMap<>();
+        data.put("asset_identifier", "STX");
+        data.put("amount", "1000");
+        data.put("sender", "SP111");
+        data.put("recipient", "SP222");
+        eventDto.setData(data);
+        StacksTransaction transaction = new StacksTransaction();
+
+        // When
+        TransactionEvent event = parser.parseEvent(eventDto, transaction, 0);
+
+        // Then - should parse correctly via EventType.fromWireFormat()
+        assertThat(event).isInstanceOf(FTTransferEvent.class);
+    }
+
+    @Test
+    void testParseEvent_WithoutEventSuffix_ShouldUseFromWireFormat() {
+        // Given - without "_EVENT" suffix (new format)
+        EventDto eventDto = new EventDto();
+        eventDto.setType("FT_TRANSFER");
+        Map<String, Object> data = new HashMap<>();
+        data.put("asset_identifier", "STX");
+        data.put("amount", "1000");
+        data.put("sender", "SP111");
+        data.put("recipient", "SP222");
+        eventDto.setData(data);
+        StacksTransaction transaction = new StacksTransaction();
+
+        // When
+        TransactionEvent event = parser.parseEvent(eventDto, transaction, 0);
+
+        // Then - should parse correctly via EventType.fromWireFormat()
+        assertThat(event).isInstanceOf(FTTransferEvent.class);
+    }
+
+    @Test
+    void testParseEvent_UnknownType_ShouldReturnNull() {
+        // Given
+        EventDto eventDto = new EventDto();
+        eventDto.setType("UNKNOWN_INVALID_TYPE");
+        Map<String, Object> data = new HashMap<>();
+        eventDto.setData(data);
+        StacksTransaction transaction = new StacksTransaction();
+
+        // When
+        TransactionEvent event = parser.parseEvent(eventDto, transaction, 0);
+
+        // Then - unknown types return null (logged as warning)
+        assertThat(event).isNull();
+    }
+
     // Helper methods
 
     private BlockEventDto createTestBlockEvent(Long height, String hash, String parentHash, Long timestamp) {
