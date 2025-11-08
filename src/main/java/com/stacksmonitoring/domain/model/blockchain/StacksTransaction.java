@@ -10,6 +10,7 @@ import org.springframework.data.annotation.CreatedDate;
 import org.springframework.data.jpa.domain.support.AuditingEntityListener;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -64,8 +65,13 @@ public class StacksTransaction {
     @Column(nullable = false)
     private Long nonce;
 
-    @Column(name = "fee_rate", precision = 30)
-    private BigDecimal feeRate;
+    /**
+     * Transaction fee in microSTX (1 STX = 1,000,000 microSTX).
+     * Stored as String to avoid precision loss with very large numbers.
+     * Use getFeeInStx() for display purposes.
+     */
+    @Column(name = "fee_micro_stx", precision = 50)
+    private BigInteger feeMicroStx;
 
     @Column(name = "execution_cost_read_count")
     private Long executionCostReadCount;
@@ -145,5 +151,16 @@ public class StacksTransaction {
      */
     public boolean isSponsored() {
         return sponsorAddress != null && !sponsorAddress.isEmpty();
+    }
+
+    /**
+     * Get fee in STX (formatted for display).
+     * Converts microSTX to STX (1 STX = 1,000,000 microSTX).
+     *
+     * @return Fee in STX as BigDecimal, or null if fee not set
+     */
+    public BigDecimal getFeeInStx() {
+        if (feeMicroStx == null) return null;
+        return new BigDecimal(feeMicroStx).divide(BigDecimal.valueOf(1_000_000));
     }
 }
