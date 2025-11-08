@@ -1,0 +1,4888 @@
+Ne doğru?
+
+
+Tip-bazlı cache: @Cacheable("alertRules", key = "#ruleType") ile kural listesi DB’den çekilip bellekte tutuluyor. Bu, her çağrıda DB’yi dövmeyi engeller → iyi.
+
+
+Polimorfik eşleştirme: rule.matches(context) ile kural türüne göre context (ContractCall, TransactionEvent, Transaction) geçiliyor. Tip güvenliği/okunabilirlik için doğru yön.
+
+
+Cooldown kontrolü: rule.isInCooldown() denetimi her tetikleme öncesi var → gereklilik.
+
+
+Tek işlem (transactional) akış: @Transactional ile bildirim kayıtları ve lastTriggeredAt güncellemesi atomik → tutarlılık için iyi bir başlangıç.
+
+
+
+Neler sorun / eksik?
+
+
+“O(1) lookup” iddiası gerçek değil
+
+
+Yapılan şey tipine göre listeyi cache’lemek. Sonra:
+
+
+Contract call için: tüm CONTRACT_CALL kurallarını döngülüyorsun.
+
+
+Event için: tüm TOKEN_TRANSFER kurallarını döngülüyorsun.
+Bu O(k) (tipteki kural sayısı) karmaşıklık. Kural sayısı büyüyünce bottleneck olur. Önerdiğim kontrat/asset/func-name indeksleme yok.
+
+
+
+
+Event kapsamı dar
+
+
+evaluateEvent sadece TOKEN_TRANSFER kurallarına bakıyor, ardından PRINT_EVENT özel kontrolü var. NFT transfer, ADDRESS_ACTIVITY vs. gibi tipler kapsama alınmamış. Olay tipine göre ilgili kural tipine gitmesi gerekir.
+
+
+Kontrat/asset bazlı ön filtre yok
+
+
+Şu an “uygun kontrata ait kural var mı”yı rule.matches içinde ayıklıyorsun. Bu, her olay için yüzlerce kuralı gereksiz yere denemek demek. Önceden kontratId / asset / functionName ile aday kural alt-kümeleri seçilmeli.
+
+
+İkiz tetik / yarış durumu (cooldown & concurrency)
+
+
+isInCooldown() + markAsTriggered() uygulama seviyesinde. Yükte iki thread aynı kuralı aynı anda tetikleyebilir (özellikle çoklu instance’ta). Optimistic locking veya DB seviyesinde koşullu update yok → çifte bildirim riski.
+
+
+İdempotensi yok (çoğaltılmış bildirim riski)
+
+
+Aynı rule + tx + (event) + channel için duplicate AlertNotification üretimi mümkün (yeniden işleme, tekrar gelen webhook vb.). Unique constraint veya UPSERT yok.
+
+
+Cache’te mutable JPA entity tutuyorsun
+
+
+getActiveRulesByType dönen entity listesi cache’te duruyor; sonra rule.markAsTriggered() ile aynı nesneyi mutasyona uğratıyorsun.
+
+
+Tek instance için “çalışır gibi” görünse de thread-safety ve multi-instance/dağıtık cache (Redis) senaryosunda sorun çıkarır.
+
+
+Üstelik lastTriggeredAt gibi sık değişen alanları cache’te tutmak stale/tutarsız davranışlar yaratır.
+
+
+
+
+DB yazımı parça parça ve gereksiz roundtrip
+
+
+createNotifications içinde her kanal için tek tek save var. Basit optimizasyon: saveAll + toplu flush.
+
+
+Cache invalidation zayıf
+
+
+invalidateRulesCache() var ama kim/nerede çağıracak? Kural oluşturma/güncelleme/silmede doğrudan tetiklenmeli (servis içinde), yoksa eski kural listesi kalır.
+
+
+Observability yok
+
+
+Eşleştirme süresini, bulunan aday kural sayısını, üretilen bildirim sayısını ölçen metrik yok. Performansı objektif takip edemezsin.
+
+Net öneriler (uygulanabilir ve etkili)
+Aşağıdakiler, mevcut sınıfı bozmadan kademeli güçlendirir. Önce 1–4 maddeleri ele al; gerçekten fark yaratır.
+1) Aday kural indeksleri (kontrat/asset/func) – gerçek O(1) adayı
+Bir “okuma amaçlı snapshot” index yapısı kur ve cache’le. Örn.:
+// 1) Immutable snapshot (DTO), entity değil:
+public record RuleSnapshot(
+    Long id, AlertRuleType type, String contractId, String assetId, String functionName,
+    Duration cooldown, Set<NotificationChannel> channels, /*…diğer gerekli alanlar…*/
+    Predicate<Object> matcher // precompiled match predicate
+) { }
+
+// 2) Bellek içi indeks:
+public record RuleIndex(
+    Map<String, List<RuleSnapshot>> byContractCall, // key = contractId or "*"
+    Map<String, List<RuleSnapshot>> byFungibleAsset, // key = assetId or "*"
+    Map<AlertRuleType, List<RuleSnapshot>> byType
+) {}
+
+Snapshot’ı AlertRule’dan immutable olarak üret; matcher’ı kural tipine göre önceden derle (parse yok).
+İnşa ve cache:
+@Cacheable("ruleIndex") // tek bir entry
+public RuleIndex buildIndex() {
+    var active = alertRuleRepository.findAllActive();
+    // map’leri doldur, null değerler için "*" wildcard kullan
+    // ContractCallAlertRule -> byContractCall.put(contractId,…)
+    // TokenTransferAlertRule -> byFungibleAsset.put(assetId,…)
+    // Ayrıca byType da doldur
+}
+
+Kullanım:
+private List<RuleSnapshot> candidatesFor(ContractCall call) {
+    var idx = ruleIndex(); // cache’ten
+    return Stream.concat(
+        idx.byContractCall().getOrDefault(call.getContractIdentifier(), List.of()).stream(),
+        idx.byContractCall().getOrDefault("*", List.of()).stream()
+    ).toList();
+}
+
+private List<RuleSnapshot> candidatesFor(TokenTransferEvent e) { /* benzer */ }
+
+Böylece sadece ilgili kurallar denenir → pratikte O(1)–O(log n) adaya düşersin.
+
+Not: Kural değişince index cache’ini invalid et: create/update/delete işleminde @CacheEvict(cacheNames="ruleIndex", allEntries=true).
+
+2) Olay tipine göre yönlendirme (kapsamı tamamla)
+private List<AlertNotification> evaluateEvent(StacksTransaction tx, TransactionEvent event) {
+    return switch (event.getType()) {
+        case FT_TRANSFER    -> evalTokenTransfer(tx, (FtTransferEvent) event);
+        case NFT_TRANSFER   -> evalNftTransfer(tx, (NftTransferEvent) event);
+        case PRINT          -> evalPrint(tx, event);
+        case ADDRESS_ACT    -> evalAddressActivity(tx, event);
+        // … diğer tipler …
+        default             -> List.of();
+    };
+}
+
+Her dalda o tipe uygun aday kural listesini indeks üzerinden çek ve sadece onları matcher.test(context) ile dene.
+3) Cooldown’ı yarışa kapat (optimistic locking / koşullu update)
+Entity’ye @Version ekle veya doğrudan koşullu update yap:
+@Modifying
+@Query("""
+ UPDATE AlertRule r
+    SET r.lastTriggeredAt = :now
+  WHERE r.id = :id
+    AND (r.lastTriggeredAt IS NULL OR r.lastTriggeredAt <= :windowStart)
+""")
+int markTriggeredIfOutOfCooldown(Long id, Instant now, Instant windowStart);
+
+shouldTrigger sadece okur, tetikleme aşamasında tek satırlık bu UPDATE çalışır; dönüş 1 ise tetiklenmiştir, 0 ise cooldown yüzünden yarış kazandırmaz.
+Böylece “iki thread aynı anda” probleminden kurtulursun ve cache’te mutable alan tutma ihtiyacı kalmaz.
+4) Bildirim idempotenti + toplu kayıt
+Tabloda unique constraint koy:
+@Table(uniqueConstraints = @UniqueConstraint(
+    name="uk_notification_rule_tx_event_channel",
+    columnNames={"alert_rule_id","transaction_id","event_id","channel"}))
+
+Kaydederken:
+var toSave = new ArrayList<AlertNotification>();
+// … ekle …
+try {
+    alertNotificationRepository.saveAll(toSave); // tek roundtrip
+} catch (DataIntegrityViolationException e) {
+    // duplicate -> yoksay veya mevcut kaydı dön
+}
+
+Bu, yeniden işleme/tekrar gelen webhook durumlarında çoğaltmayı engeller.
+5) Cache stratejisini sağlamlaştır
+
+
+Entity yerine snapshot (immutable DTO) cache’le → thread-safe, dağıtık cache-friendly.
+
+
+Çoklu instance düşünüyorsan Redis Cache kullan (Spring Cache → Redis).
+
+
+Kural değişimlerinde invalidateRulesCache() otomatik çağrılsın (service içinde, create/update/delete sonunda).
+
+
+6) Gözlemlenebilirlik ekle (hemen fayda)
+Eşleştirme süresini ve aday sayısını ölç:
+Timer.Sample s = Timer.start(registry);
+int candidates = /* seçilen aday kural sayısı */;
+try {
+   // match + persist
+} finally {
+   s.stop(registry.timer("alert.match.ms", "type", ruleType.name()));
+   registry.counter("alert.match.candidates", "type", ruleType.name())
+           .increment(candidates);
+   registry.counter("alert.notifications.created").increment(notifications.size());
+}
+
+7) Küçük ama etkili düzeltmeler
+
+
+getStats() iki kez DB’ye gidiyor; tek sorguyla topla.
+
+
+buildNotificationMessage içinde transaction.getBlock() null olabilir (erken aşamada). NPE korunumu ekle.
+
+
+evaluateTransaction içinde loop’ta save yerine bufferlayıp saveAll.
+
+
+evaluateFailedTransaction sadece !getSuccess() – optional olarak status code / reason bazlı kural tiplerini ayır.
+
+
+
+Örnek: “aday seç, idempotent kaydet, DB-tabanlı cooldown”
+Aşağıda mevcut tasarımı bozmadan (metod imzaları aynı kalabilir) kritik akışı nasıl güvenli/performant yapabileceğine dair örnek iskelet:
+@Transactional
+public List<AlertNotification> evaluateTransaction(StacksTransaction tx) {
+    var out = new ArrayList<AlertNotification>();
+
+    if (tx.getContractCall() != null) {
+        var candidates = candidatesFor(tx.getContractCall()); // index’ten
+        out.addAll(matchAndCreate(candidates, tx, null, tx.getContractCall()));
+    }
+
+    for (TransactionEvent ev : tx.getEvents()) {
+        var candidates = candidatesFor(ev); // tipine göre uygun index
+        out.addAll(matchAndCreate(candidates, tx, ev, ev));
+    }
+
+    if (Boolean.FALSE.equals(tx.getSuccess())) {
+        var candidates = index.byType().getOrDefault(AlertRuleType.FAILED_TRANSACTION, List.of());
+        out.addAll(matchAndCreate(candidates, tx, null, tx));
+    }
+
+    // Tek seferde persist (idempotent unique constraint’le güvenli)
+    alertNotificationRepository.saveAll(out);
+    return out;
+}
+
+private List<AlertNotification> matchAndCreate(
+        List<RuleSnapshot> candidates,
+        StacksTransaction tx,
+        @Nullable TransactionEvent ev,
+        Object context
+) {
+    var created = new ArrayList<AlertNotification>();
+    for (var snap : candidates) {
+        if (!snap.matcher().test(context)) continue;
+
+        // DB tabanlı cooldown: koşullu update ile tek atış
+        int updated = alertRuleRepository.markTriggeredIfOutOfCooldown(
+            snap.id(), Instant.now(), Instant.now().minus(snap.cooldown()));
+
+        if (updated == 0) continue; // cooldown içinde yarış kaybedildi
+
+        for (var ch : snap.channels()) {
+            var n = new AlertNotification(/* ruleId=snap.id(), tx, ev, ch, message … */);
+            created.add(n);
+        }
+    }
+    return created;
+}
+
+Bu düzenleme ile:
+
+
+Performans: Aday kümesi çok küçük (index).
+
+
+Doğruluk: Cooldown DB’de atomik; yarış yok.
+
+
+Dayanıklılık: Bildirim idempotent; çoğaltma yok.
+
+
+Verim: saveAll tek roundtrip.
+
+
+
+Sonuç (hızlı özet)
+
+
+Şu anki servis çalışır, ancak “tip-bazlı cache + full scan” yaklaşımı kural sayısı büyüyünce ölçeklenmez.
+
+
+Gerçekleştirilmesi gereken kilit farklar: kontrat/asset/func-name bazlı index, DB-tabanlı cooldown, idempotent bildirim, immutable snapshot cache.
+
+
+Event yönlendirmesini tamamla (NFT/ADDRESS_ACTIVITY vb.) ve ölçüm/metrikleri ekle.
+
+
+Bunları yaptığında hem performans hem tutarlılık hem de çoklu instance uyumu net olarak iyileşir.
+
+
+İstersen bu sınıfı birlikte “PR seviyesinde” refactor edelim; hedeflediğin veri modeli (rule alt tipleri, event alt tipleri) doğrultusunda indeks anahtarlarını seçip, gerekli repository metotlarını ve migration’ları da çıkarırım.
+
+
+
+
+
+--------------------------------------------
+
+
+
+
+ProcessChainhookPayloadUseCase — derin inceleme
+güçlü taraflar
+
+
+tek akış/tek transaction: processPayload @Transactional, apply ve rollback aynı iş biriminde yönetiliyor → veri tutarlılığı açısından doğru başlangıç.
+
+
+idempotency denemesi: apply’de blok hash ile var/yok kontrolü yapılıyor.
+
+
+hata yalıtımı: tek tek transaction parse/gönderim hatalarını yakalayıp diğerlerini işlemeye devam ediyor.
+
+
+bildirimleri toplu dispatch: sonunda dispatchBatch(allNotifications) çağırması doğru bir fikir (tek tek dispatch yerine).
+
+
+sorunlar / riskler
+
+
+rollback “soft delete” yorum hatası:
+
+
+Yorumda “Events will be cascade deleted via JPA orphanRemoval” yazıyor; orphanRemoval sadece koleksiyondan nesneyi çıkarınca fiziksel silme yapar. tx.markAsDeleted() soft delete ise event’ler silinmez/işaretlenmez. Şu an event’lerin “deleted” flag’i yoksa veri tutarsız kalır.
+
+
+Ayrıca, rollback’te block/tx restore edilmesi (apply ile “deleted=false” yapılması) event’lerin restore’u yapılmıyor → geri dönüş (reorg) sonrası durum eksik.
+
+
+
+
+idempotency eksik/yarım:
+
+
+Apply’de sadece blockHash kontrolü var. Bir blok var ama içerdiği transaction’ların bir kısmı commit öncesi hata yüzünden yazılmadıysa ikinci denemede “block exists, skipping” diyorsun → yarım blok kalır.
+
+
+Transaction düzeyinde existsByTxId/upsert yok. Bu da re-delivery veya tekrar işleme halinde çift kayıt ya da atlama riski yaratır.
+
+
+
+
+bildirimleri commit’ten önce gönderebilme riski:
+
+
+alertMatchingService.evaluateTransaction DB’ye AlertNotification kaydı atıyor. Sonra aynı transaction bitmeden notificationDispatcher.dispatchBatch(allNotifications) çağrılıyor.
+
+
+Dispatcher e-posta/webhook gönderirse ve commit sonra fail olursa, dış sistemlere “hayalet” bildirim gitmiş olur.
+
+
+Tersine, dispatcher DB’den PENDING çekecekse uncommitted kayıtları göremeyebilir.
+
+
+
+
+bellek ve batch yönetimi:
+
+
+Büyük payload’larda bütün AlertNotification’ları allNotifications liste­sinde tutmak memory spike yaratır.
+
+
+blockRepository.save(block) her blokta büyük graph’ı tek seferde flush edebilir, JDBC batch ayarı yoksa yüksek roundtrip.
+
+
+
+
+concurrency ve sıra garantisi:
+
+
+Chainhook hızlı ardışık çağrı atarsa aynı blok birden fazla süreçte işlenebilir. Sadece hash kontrolü var → yarışta çifte parse/çifte save denemeleri, optimistic lock veya unique kısıt yoksa duplicate riski.
+
+
+
+
+deleted filtreleri yok:
+
+
+Soft delete yaptığın block/tx’ler için tüm okuma sorgularında (query servisleri/raporlar) deleted=false filtresi yoksa kirli veri döndürürsün.
+
+
+
+
+önerilen düzeltmeler (parça parça, uygulanabilir)
+A) Rollback’i tamamla (event’ler ve bildirimler dahil)
+private int handleRollbacks(List<BlockEventDto> rollbackEvents) {
+  int count = 0;
+  for (var be : rollbackEvents) {
+    var hash = be.getBlockIdentifier().getHash();
+    var blockOpt = blockRepository.findByBlockHashWithTxAndEvents(hash); // fetch join
+    if (blockOpt.isEmpty()) { log.warn("..."); continue; }
+    var block = blockOpt.get();
+    block.setDeleted(true); block.setDeletedAt(Instant.now());
+    for (var tx : block.getTransactions()) {
+      tx.setDeleted(true); tx.setDeletedAt(Instant.now());
+      for (var ev : tx.getEvents()) { ev.setDeleted(true); ev.setDeletedAt(Instant.now()); }
+    }
+    // varsa bu block/tx/event ile ilişkili AlertNotification’ları da işaretle:
+    alertNotificationRepository.invalidateByBlockId(block.getId()); // set is_invalidated = true
+    count++;
+  }
+  return count;
+}
+
+
+notlar:
+• entity’lere deleted & deletedAt alanları yoksa ekleyin ve @Where(clause="deleted=false") ile global filtre uygulayın.
+• fetch-join repository metodları ekleyin (N+1 ve lazy sorunlarını önlemek için).
+
+B) Apply’i idempotent ve self-heal yap
+
+
+blok kontrolü: hash + height ikilisini unique yapın; var ise transaction sayısı ve eksik tx’ları tamamlayın.
+
+
+transaction upsert: findByTxId ile yoksa ekle, varsa skip/merge.
+
+
+event upsert: tx içinde eventIndex + eventType unique ile idem.
+
+
+Örnek (basitleştirilmiş):
+if (transactionRepository.existsByTxId(txHash)) {
+   // eksik event var mı kontrol et, yoksa geç
+} else {
+   // yeni tx + events ekle
+}
+
+C) Dispatch’i commit SONRASINA taşı
+
+
+Spring’in TransactionSynchronizationManager.registerSynchronization(...) ile afterCommit hook’unda dispatcher çağırın; ya da ApplicationEventPublisher ile domain event yayımlayıp @TransactionalEventListener(phase = AFTER_COMMIT) ile dinleyin.
+
+
+TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronizationAdapter() {
+  @Override public void afterCommit() {
+     notificationDispatcher.dispatchBatch(allNotifications);
+  }
+});
+
+D) Chunk + batch + flush/clear
+
+
+Büyük bloklarda parser.parseTransaction sonrası her 200 kayıt bir arada saveAll, ardından entityManager.flush(); entityManager.clear();
+
+
+spring.jpa.properties.hibernate.jdbc.batch_size=200 ayarla.
+
+
+E) yarışları kapat
+
+
+Block/Tx/Event tablolarına unique kısıtlar (block_hash, tx_id, (tx_id,event_index,type)).
+
+
+Re-delivery’de duplicate insert denemesi DataIntegrityViolationException ile düşerse yakala + yoksay (idempotent).
+
+
+F) deleted filtreleri
+
+
+Block, Transaction, Event entity’lerine:
+@Where(clause="deleted=false") + index (deleted, block_id vs.).
+
+
+Repository metotlarını deleted=false ile yaz.
+
+
+
+AlertRule (base) — derin inceleme
+güçlü taraflar
+
+
+SINGLE_TABLE + discriminator: kolay sorgu, basit yönetim.
+
+
+@Version alanı: optimistic locking temeli var.
+
+
+cooldown mantığı ve lastTriggeredAt: kural spam’ini frenlemek için doğru.
+
+
+kanalların JSONB saklanması: email/webhook listesi için esnek.
+
+
+sorunlar / riskler
+
+
+cooldown uygulaması uygulama seviyesinde:
+
+
+Şu an isInCooldown() + markAsTriggered() ile çalışıyor. Aynı anda iki thread tetikleyince ikisi de geçebilir (TOCTOU). @Version 2. kayıtta OptimisticLockException atar → bu exception üst katmanda yakalanmadığı için tüm işlem rollback olur.
+
+
+
+
+kanal/e-posta şeması:
+
+
+notificationEmails tek string (CSV?) → doğrulama/splitting gerektiriyor; normalize edilmediği için hataya açık.
+
+
+
+
+SINGLE_TABLE şişmesi:
+
+
+Alt tipler büyürse çok kolonlu tek tablo (pek çok null) oluşur. İlk etapta kabul edilebilir ama orta vadede JOINED tercih edilebilir.
+
+
+
+
+JSONB alanlar için validasyon yok:
+
+
+notification_channels JSON’unda enum dışı değer gelirse? Bean validation / custom validator eksik.
+
+
+
+
+tenant/ownership enforcement:
+
+
+user_id var ama repository katmanında tüm sorgularda user filtresi zorlanmıyorsa, çok kiracı senaryosunda veri sızıntısı riski.
+
+
+
+
+öneriler
+
+
+DB-tabanlı cooldown (yarışı önle):
+Uygulama seviyesi kontrol yerine koşullu UPDATE kullan (başarısızsa tetikleme). @Version’ı tut ama exception fırlatmayacak akış kur:
+
+
+@Modifying
+@Query("""
+  UPDATE AlertRule r
+     SET r.lastTriggeredAt = :now, r.updatedAt = :now
+   WHERE r.id = :id
+     AND (r.lastTriggeredAt IS NULL OR r.lastTriggeredAt <= :windowStart)
+""")
+int markTriggeredIfOutOfCooldown(Long id, Instant now, Instant windowStart);
+
+
+AlertMatching’de shouldTrigger sadece “kandidatı dener”, kesin tetiklemek istediğinde bu update’i çalıştır, dönüş 1 ise tetikle, 0 ise cooldown.
+
+
+
+emails/kanallar normalize et:
+alert_rule_email(address varchar, rule_id fk) gibi join tablo; JSONB yerine tablo ve constraint. İlk sürüm için split de olur ama validasyon ekle.
+
+
+JSONB validasyon:
+Hibernate Validator + custom constraint ile notification_channels ve alt tip JSON alanlarına şema doğrulaması.
+
+
+uzun vadede JOINED:
+Alt tipler çoğalırsa migration planı (JOINED) hazırlayın.
+
+
+
+AddressActivityAlertRule — derin inceleme
+güçlü taraflar
+
+
+alt tip mantığı doğru (discriminator ile).
+
+
+SENDER kontrolü MVP için basit fakat kullanılabilir.
+
+
+sorunlar / riskler
+
+
+yalnızca SENDER: RECIPIENT ve CONTRACT_DEPLOYER TODO kalmış → kural kapsamı dar.
+
+
+case/format: Stacks adreslerinin format farkları (hex vs c32check) → eşleşme hatası olabilir.
+
+
+event bağımlılığı: alıcıyı bulmak için event parse gerekiyor; ama burada doğrudan Transaction’dan bakılıyor.
+
+
+indexleme: bu rule için watched_address üzerinde indexed erişim (kural indexi) yoksa tüm ADDRESS_ACTIVITY kuralları taranır.
+
+
+öneriler
+
+
+tam implementasyon:
+
+
+RECIPIENT için transaction event’lerini (FT/NFT/STX transfer) tara.
+
+
+CONTRACT_DEPLOYER için kontrat deploy eventi/tx tipini kontrol et.
+
+
+
+
+adres standardizasyonu:
+Normalleştir (lowercase, trim) + gerekirse bech32/c32 dönüşüm helper’ı.
+
+
+aday seçimi:
+AlertMatching’te “sender = X” ve “recipient = Y” için ön index (adres→kural listesi) kullan.
+
+
+performans:
+Çok kuralda lineer tarama yerine önce adres haritası → sonra matcher.
+
+
+Örnek matches genişletmesi (özet):
+if (activityTypes.contains("RECIPIENT")) {
+  return tx.getEvents().stream().anyMatch(ev ->
+     ev instanceof FtTransferEvent ft && watchedAddress.equalsIgnoreCase(ft.getRecipient()));
+}
+if (activityTypes.contains("CONTRACT_DEPLOYER")) {
+  return tx.getTxType() == TransactionType.SMART_CONTRACT && watchedAddress.equalsIgnoreCase(tx.getSender());
+}
+
+
+PrintEventAlertRule — derin inceleme
+güçlü taraflar
+
+
+kontrat + topic filtreleri üretimde en sık ihtiyaç → düzgün.
+
+
+alt tip kural (PRINT_EVENT) olarak ayrılmış.
+
+
+sorunlar / riskler
+
+
+context tipi uyuşmazlığı ihtimali: matches parametresi SmartContractEvent bekliyor; AlertMatchingService TransactionEvent yolluyor. Eğer SmartContractEvent, TransactionEvent’in bir alt sınıfı değilse hiçbir zaman tetiklenmez.
+
+
+data_conditions TODO: JSONPath vs. yok, sadece düz kontroller → kapsam dar.
+
+
+indexleme yok: kontrat+topic’e göre aday kural seçimi yapılmıyorsa tüm PRINT_EVENT kurallarını tararsın.
+
+
+öneriler
+
+
+tip uyumu:
+SmartContractEvent’i TransactionEvent alt sınıfı yap ya da AlertMatching’de PRINT için doğru tipi geçir.
+
+
+JSONPath değerlendirme (üretim):
+JSON data üzerinde basit operatörler (eq, gt, lt…) için küçük bir evaluator (Jayway JsonPath) entegre et.
+
+
+aday index: kontrat+topic → kural listesi map’i.
+
+
+Örnek:
+if (dataConditions != null) {
+  DocumentContext ctx = JsonPath.parse(event.getDataJson());
+  for (var e : dataConditions.entrySet()) {
+    if (!evaluate(ctx, e.getKey(), e.getValue())) return false;
+  }
+}
+return true;
+
+
+TransactionQueryService — derin inceleme
+güçlü taraflar
+
+
+paginate edilmiş sorgular (Pageable) ve tip/sender filtreleri ile temel API zengin.
+
+
+readOnly transaction doğru ayarlanmış.
+
+
+sorunlar / riskler
+
+
+soft delete filtresi yok: rollback ile deleted=true işaretlenen kayıtlar hala listelere girebilir.
+
+
+N+1 / serialization: Controller düzeyinde entity’leri doğrudan döndürürsen LAZY alanlar ve döngüsel referanslar sorun; ayrıca findAll(pageable) her şeyi getirir (ağır entity grafı).
+
+
+index/performans:
+
+
+findBySender(sender, pageable) için sender index’i şart.
+
+
+findByTxType için (tx_type) index.
+
+
+findBySuccess için (success) index.
+
+
+
+
+DTO/Projection yok: gereksiz alan taşınıyor; API sözleşmesi net değil.
+
+
+öneriler
+
+
+@Where veya global soft-delete filtresi:
+Entity’lere @Where(clause="deleted=false") (veya Hibernate Filter) ekleyin; tüm repository metodları otomatik temiz veri döndürsün.
+
+
+Projection/DTO layer:
+Query’leri lightweight projection ile yapın: interface TxListView { String getTxId(); Instant getTime(); boolean getSuccess(); ... }
+Page<TxListView> findBySender(String sender, Pageable p);
+
+
+fetch join noktasal:
+Tekil getTransactionById vs. için @EntityGraph veya fetch join.
+
+
+indexler:
+Flyway’de create index idx_tx_sender on stacks_tx(sender) vb.
+
+
+arama:
+İleride esnek arama için Spring Data Specifications ya da Elasticsearch düşün.
+
+
+
+Çapraz etkiler ve eksik kalanlar (önem sırası ile)
+
+
+AlertMatching + Rule tabanı
+
+
+Mevcut AlertMatching’te “tip bazlı cache + full scan” var. Yukarıda verdiğim aday-indeks (contractId/asset/topic/adres→kurallar) + DB-tabanlı cooldown + idempotent notification kombinasyonu, ProcessChainhook akışının performans ve doğruluğunu doğrudan yükseltir.
+
+
+@Version optimistic lock’ı exceptionsız yutacak şekilde revize edin (koşullu update metodu).
+
+
+
+
+Commit sonrası dispatch
+
+
+“Önce commit, sonra dispatch” kuralını uygula: AFTER_COMMIT event ya da TransactionSynchronization. Bu, yanlış pozitif bildirimleri engeller.
+
+
+
+
+Reorg tamamlama ve soft delete altyapısı
+
+
+Block/Tx/Event/Notification için deleted + deletedAt; entity’lere @Where.
+
+
+Rollback’te event & notification invalidation/restore de yap.
+
+
+
+
+Idempotent upsert
+
+
+Block hash unique, txId unique, (txId,event_index,event_type) unique.
+
+
+Duplicate insert yakala → yoksay; eksik alt kayıtları “merge” et.
+
+
+
+
+Observability
+
+
+Timer/Counter: “payload işleme süresi”, “candidate rule sayısı”, “üret. bildirim sayısı”, “rollback sayısı”…
+
+
+Log: her blokta “persisted X tx / Y events”, her eşleştirmede “candidate K, matched M”.
+
+
+
+
+
+Hızlı PR planı (adım adım)
+P0 (kritik, küçük PR’lar):
+
+
+AFTER_COMMIT dispatch: ProcessChainhookPayloadUseCase → dispatch’i afterCommit’e taşı.
+
+
+DB cooldown: AlertRuleRepository’de markTriggeredIfOutOfCooldown(...) ekle; MatchingService tetiklemede onu kullan. OptimisticLockException riskini kaldır.
+
+
+Idempotent Notification: notification tablosuna unique constraint; saveAll + duplicate swallow.
+
+
+Rollback düzeltmesi: event & notifications invalidation; @Where(deleted=false) ekle.
+
+
+P1 (performans/ölçek):
+5. RuleIndex cache (immutable snapshot): contract/asset/topic/adres bazlı indeks; cache invalidation.
+6. Apply idempotency/merge: tx/event düzeyinde upsert; duplicate yakalama.
+7. Batch insert & flush/clear: JDBC batch; büyük payload için chunk.
+P2 (temizlik/ileri seviye):
+8. AddressActivity tamamlama: RECIPIENT/DEPLOYER; adres normalizasyon.
+9. PrintEvent JSONPath: data_conditions değerlendirme.
+10. Query DTO/Projection, indexler: Tx query’leri hafiflet; indeksleri Flyway ile ekle.
+
+kısa “doğru/yanlış/iyileştir” özetleri (tek satırlık)
+
+
+ProcessChainhook: doğru: tek transaction; yanlış: commit öncesi dispatch, yarım idempotency; iyileştir: afterCommit dispatch, tx/event upsert, rollback tamamlama.
+
+
+AlertRule (base): doğru: inheritance, cooldown taslağı, @Version; yanlış: cooldown yarışa açık; iyileştir: DB koşullu update, JSON/kanal validasyonu.
+
+
+AddressActivity: doğru: alt tip; yanlış: sadece SENDER; iyileştir: recipient/deployer, adres normalizasyonu, aday index.
+
+
+PrintEvent: doğru: kontrat+topic; yanlış: context tipi uyumsuz olabilir, data_conditions boş; iyileştir: tip uyumu, JSONPath, aday index.
+
+
+TransactionQueryService: doğru: pageable; yanlış: soft-delete filtresi yok, ağır entity dönüşü; iyileştir: @Where, projection, indexler.
+
+
+bu değişikliklerle, verdiğin kod tabanı production-ready hedefe yaklaşır: yanlış bildirim/çifte tetik riskleri kalkar, reorg sağlamlaşır, kural eşleştirme ölçeklenir, gözlemlenebilirlik artar. istersen yukarıdaki maddeleri temel alan birer PR şablonu ve patch kodu da çıkartırım; hangi kalemden başlamak istediğini söylemen yeterli.
+
+
+
+--------------------------------------------
+
+
+
+harika, alt yapının “config” tarafını tek tek röntgenledim. Aşağıda hem güçlü yanları hem de P0/P1/P2 önceliklerine göre düzeltme/iyileştirme önerileri ve PR-taslak difflere yakın kod parçaları var. Parser’ı (ChainhookPayloadParser) gönderdiğinde aynı titizlikte onun da incelemesini yaparım.
+
+Ne var elde? (kapsam)
+
+SecurityConfiguration: stateless JWT, RateLimit ve HMAC filtre sıralaması, public endpoint tanımları. 
+
+SecurityConfiguration
+
+JwtAuthenticationFilter: Bearer token okuma/validate ve SecurityContext set etme. 
+
+JwtAuthenticationFilter
+
+ 
+
+JwtAuthenticationFilter
+
+JwtTokenService: HS256 ile imzalama/parse; yorum RS256 hedefli. 
+
+JwtTokenService
+
+ 
+
+JwtTokenService
+
+ 
+
+JwtTokenService
+
+ChainhookHmacFilter: X-Signature HMAC-SHA256 doğrulama, constant-time karşılaştırma. 
+
+ChainhookHmacFilter
+
+ 
+
+ChainhookHmacFilter
+
+RateLimitFilter: Bucket4j, kullanıcı/IP bazlı limit, varsayılan 100 rpm. 
+
+RateLimitFilter
+
+ 
+
+RateLimitFilter
+
+CustomUserDetailsService: email ile kullanıcıyı yükleyip ROLE_… yetkisi veriyor, disabled kontrolü var. 
+
+CustomUserDetailsService
+
+ 
+
+CustomUserDetailsService
+
+NotificationConfig: RestTemplate + timeout (10s/30s). 
+
+NotificationConfig
+
+init-db.sql: uuid-ossp açıyor, ilk kurulum mesajı. 
+
+init-db
+
+README: Güvenlikte RS256 hedefi yazıyor (kod HS256), prod checklist ve profiller. 
+
+README
+
+ 
+
+README
+
+Güçlü yönler (kısa)
+
+Stateless güvenlik zinciri ve BCrypt(12) iyi bir taban. 
+
+SecurityConfiguration
+
+ 
+
+SecurityConfiguration
+
+JWT filtresi minimal, yan etkisiz ve idempotent (OncePerRequestFilter). 
+
+JwtAuthenticationFilter
+
+HMAC filtresi body üzerinden HMAC ve constant-time karşılaştırma yapıyor (doğru yaklaşım). 
+
+ChainhookHmacFilter
+
+Rate limiting login/anon farkını gözetip IP fallback yapıyor. 
+
+RateLimitFilter
+
+Notification RestTemplate için sensibıl timeout’lar var. 
+
+NotificationConfig
+
+Açık/çelişkiler ve riskler
+P0 – kritik
+
+JWT algoritma/anahtar modeli çelişkisi (HS256 vs RS256)
+Kod HS256 kullanıyor ama dokümantasyon RS256 hedefli; HS256 tek sırra dayanır, anahtar sızıntısında tüm tokenlar tehlikede. RS256 ile private/public ayrımı, rota-asyon ve “kid” mümkün. 
+
+JwtTokenService
+
+ 
+
+README
+
+
+Öneri (PR-taslak): RS256’a geç, kid header ekle, parser’da requireIssuer ve clock skew tanımla (aşağıda snippet).
+
+RateLimit filtresi JWT’den önce çalışıyor → kullanıcı bazlı limit devre dışı
+Sıralamada RateLimit önce, JWT kimliği daha sonra set ediliyor. Bu yüzden authenticated istekler bile IP kotasına giriyor. 
+
+SecurityConfiguration
+
+ 
+
+RateLimitFilter
+
+
+Öneri (PR-taslak): RateLimit’i JwtAuthenticationFilter’dan sonra çalıştır (per-user limit aktif olsun), webhooks için ayrı bucket uygula.
+
+/actuator/ herkese açık**
+Prod’da metrikler, thread dump vb. açılmamalı. Şu an permitAll listesinde. 
+
+SecurityConfiguration
+
+
+Öneri: Sadece /actuator/health public, diğerleri basic/mTLS/allowlist.
+
+HMAC replay korunması yok
+Sadece body imzalanıyor; timestamp ve taze-lik penceresi yok. Bir saldırgan imzalı bir payload’ı tekrar yollayabilir. 
+
+ChainhookHmacFilter
+
+
+Öneri: X-Signature-Timestamp + 5 dk tolerans, imza = hex(hmac(secret, timestamp + '.' + body)).
+
+P1 – önemli
+
+CORS yok
+API tüketimi için cross-origin gerekiyorsa policy’yi açıkça tanımla. (SecurityConfiguration’da cors bean’i yok.) 
+
+SecurityConfiguration
+
+JWT hata semantiği
+Geçersiz Bearer varsa anon devam ediliyor; protected endpoint’lerde 401 dönmek daha doğru. 
+
+JwtAuthenticationFilter
+
+RateLimit bellek büyümesi ve dağıtık olmama
+ConcurrentHashMap’te bucket’lar hiç temizlenmiyor, eviction yok. Çok IP/kullanıcıda heap büyür; çok instance’da tutarsız limit olur. 
+
+RateLimitFilter
+
+Notification HTTP client dayanıklılığı
+Timeout var ama retry/backoff/circuit breaker yok; webhook/SMTP sorunlarında kuyruk/cb önemli. 
+
+NotificationConfig
+
+P2 – iyi olur
+
+UserDetails cache (sık çağrılıyorsa) ve UserDetailsPasswordService ile hash yükseltme. 
+
+CustomUserDetailsService
+
+DB init script minimal
+uuid-ossp iyi, ama prod’da migration’lar zaten Flyway ile. Script’i sadece local/dev profiline kısıtlamak mantıklı. 
+
+init-db
+
+Önerilen düzeltmeler (PR-taslak kodları)
+1) JwtTokenService → RS256, issuer zorunlu, clock skew, kid & rotation
+
+Sorun: HS256 + düz @Value secret; yorumda RS256 hedefi var. 
+
+JwtTokenService
+
+ 
+
+JwtTokenService
+
+
+Çözüm – çekirdek değişiklik:
+
+// application.yml
+security:
+  jwt:
+    issuer: stacks-monitor
+    expiration-ms: 3600000
+    jwk:
+      current-kid: key-2025-11
+      // PEM'leri env'den ya da secret store'dan oku
+      private-pem: ${JWT_PRIVATE_PEM}
+      public-pems:
+        key-2025-11: ${JWT_PUBLIC_PEM_2025_11}
+        key-2025-08: ${JWT_PUBLIC_PEM_2025_08}  # eski anahtar
+
+// JwtTokenService.java (özet)
+public class JwtTokenService {
+  @Value("${security.jwt.issuer}") String issuer;
+  @Value("${security.jwt.jwk.current-kid}") String currentKid;
+  // PEM -> Key parse yardımcıları...
+
+  public String generateToken(UserDetails user, String role) {
+    Date now = new Date();
+    return Jwts.builder()
+      .setSubject(user.getUsername())
+      .setIssuer(issuer)
+      .claim("role", role)
+      .setIssuedAt(now)
+      .setExpiration(new Date(now.getTime() + expirationMs))
+      .setHeaderParam("kid", currentKid)
+      .signWith(rs256PrivateKey, SignatureAlgorithm.RS256)
+      .compact();
+  }
+
+  public Claims parseAndValidate(String token) {
+    return Jwts.parserBuilder()
+      .setAllowedClockSkewSeconds(60)
+      .requireIssuer(issuer)
+      .setSigningKeyResolver(kidAwareResolver) // kid→public key
+      .build()
+      .parseClaimsJws(token)
+      .getBody();
+  }
+}
+
+2) SecurityConfiguration → filtre sırası, CORS, actuator kısıtları
+
+Sorun: RateLimit JWT’den önce; actuator public. 
+
+SecurityConfiguration
+
+
+Çözüm:
+
+@Bean
+SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+  http
+    .csrf(AbstractHttpConfigurer::disable)
+    .cors(Customizer.withDefaults())
+    .authorizeHttpRequests(auth -> auth
+      .requestMatchers("/api/v1/auth/**").permitAll()
+      .requestMatchers("/api/v1/webhook/**").permitAll()
+      .requestMatchers("/actuator/health","/actuator/info").permitAll()
+      .requestMatchers("/actuator/**").hasRole("ADMIN")
+      .anyRequest().authenticated()
+    )
+    .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+    .authenticationProvider(authenticationProvider())
+    // HMAC → JWT → RateLimit (kullanıcı kimliği sonra belirlenir)
+    .addFilterBefore(chainhookHmacFilter, UsernamePasswordAuthenticationFilter.class)
+    .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
+    .addFilterAfter(rateLimitFilter, JwtAuthenticationFilter.class);
+  return http.build();
+}
+
+@Bean CorsConfigurationSource corsConfigurationSource() {
+  var c = new CorsConfiguration();
+  c.setAllowedOrigins(List.of("https://senin-frontendin.com"));
+  c.setAllowedMethods(List.of("GET","POST","PUT","DELETE"));
+  c.setAllowedHeaders(List.of("Authorization","Content-Type","X-Signature","X-Signature-Timestamp"));
+  c.setMaxAge(3600L);
+  var src = new UrlBasedCorsConfigurationSource();
+  src.registerCorsConfiguration("/**", c);
+  return src;
+}
+
+3) JwtAuthenticationFilter → hata semantiği & skip paths
+
+Gerekçe: Geçersiz Bearer varsa 401; auth/webhook path’lerinde boşuna çalışmasın. 
+
+JwtAuthenticationFilter
+
+@Override
+protected boolean shouldNotFilter(HttpServletRequest req) {
+  String uri = req.getRequestURI();
+  return uri.startsWith("/api/v1/auth/") || uri.startsWith("/api/v1/webhook/");
+}
+
+@Override
+protected void doFilterInternal(...) {
+  String auth = request.getHeader("Authorization");
+  if (auth == null || !auth.startsWith("Bearer ")) {
+    filterChain.doFilter(request, response);
+    return;
+  }
+  try {
+    // ... mevcut doğrulama ...
+  } catch (JwtException ex) {
+    response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid token");
+    return;
+  }
+  filterChain.doFilter(request, response);
+}
+
+4) ChainhookHmacFilter → replay koruması, timestamp + body imzası
+
+Gerekçe: Tekrarlama saldırılarına açık. Şu an sadece body imzalanıyor. 
+
+ChainhookHmacFilter
+
+private static final String TS_HEADER = "X-Signature-Timestamp";
+private static final long MAX_SKEW_SEC = 300; // 5 dk
+
+protected void doFilterInternal(...) {
+  // ... endpoint ve enabled kontrolleri ...
+  String ts = wrappedRequest.getHeader(TS_HEADER);
+  if (ts == null) { response.sendError(401, "Missing timestamp"); return; }
+
+  long sent = Long.parseLong(ts);
+  long now = Instant.now().getEpochSecond();
+  if (Math.abs(now - sent) > MAX_SKEW_SEC) {
+    response.sendError(401, "Stale signature"); return;
+  }
+
+  byte[] body = readBody(wrappedRequest);
+  String provided = wrappedRequest.getHeader(SIGNATURE_HEADER);
+  String expected = calculateHmacSignature((ts + "." + new String(body, UTF_8)).getBytes(UTF_8));
+
+  if (!MessageDigest.isEqual(provided.getBytes(UTF_8), expected.getBytes(UTF_8))) {
+    response.sendError(401, "Invalid signature"); return;
+  }
+  filterChain.doFilter(wrappedRequest, response);
+}
+
+5) RateLimitFilter → per-route bucket, eviction, Retry-After, dağıtık seçenek
+
+Gerekçe: In-mem cache sonsuz büyüyebilir; prod’da çoğul instance’ta tutarsız limit. 
+
+RateLimitFilter
+
+// Route-aware key: userOrIp + ":" + routeGroup
+String key = routeGroup(request) + ":" + getUserIdentifier(request);
+
+// Eviction için Caffeine önerisi (yerel) veya Redis (dağıtık)
+// Örn: Caffeine.newBuilder().expireAfterAccess(10, MINUTES).maximumSize(100_000)...
+// Aşıldığında:
+response.setHeader("Retry-After", "60");
+response.setStatus(429);
+
+
+Konfig:
+
+/api/v1/webhook/**: IP başına 60 rpm (daha sık ama kontrollü)
+
+Auth/login/register: IP başına 20 rpm
+
+Authenticated API: kullanıcı başına 100 rpm
+
+6) NotificationConfig → WebClient + resilience (opsiyon)
+
+Gerekçe: Timeout var ama retry/backoff yok; webhook çağrılarında şart. 
+
+NotificationConfig
+
+@Bean
+WebClient webhookClient() {
+  return WebClient.builder()
+    .clientConnector(new ReactorClientHttpConnector(HttpClient.create()
+      .responseTimeout(Duration.ofSeconds(30))))
+    .build();
+}
+// Resilience4j: retry(maxAttempts=3, backoff=2^n) + circuitBreaker
+
+7) CustomUserDetailsService → küçük dokunuşlar
+
+@Transactional(readOnly = true) zaten var; isabetli. Caching düşünülüyorsa method-level @Cacheable("users"). 
+
+CustomUserDetailsService
+
+8) init-db.sql → sadece dev profilinde
+
+Flyway zaten şemayı yönetiyor; bu script’i dev docker compose’a sınırlayalım. 
+
+init-db
+
+Parser (ChainhookPayloadParser) için beklenti kontrol listesi
+
+Parser kodunu gönderdiğinde aşağıdakilere bakacağım (ve gerekirse hemen refactor PR önerisi çıkartırım):
+
+Streaming JSON parse (memory spike önleme) — Jackson streaming; dokümantasyonda da bu yaklaşım önerilmiş. 
+
+Stacks Blockchain Smart Contrac…
+
+Idempotency: blockHash/height bazlı duplicate tespit (UseCase tarafında idempotency var gibi ama parser’ın hata toleransı kritik).
+
+Event mapping doğruluğu: enum/valueobject eşleşmeleri, JOINED miras stratejisi ile entity’ye doğru parse (domain dokümanı). 
+
+README
+
+Rollback işaretleme senaryolarında bağışıklık (soft delete stratejisine uygun).
+
+Büyük payload performansı: parse → batch persist (50’lik JDBC batch), transaksiyonel sınır. (Roadmap/dokümanlarda yer alıyor.) 
+
+README
+
+Hızlı yol haritası (sadece “config/güvenlik” için)
+
+P0 (önce hemen)
+
+JWT’yi RS256’a geçir + kid/issuer/clock-skew (yukarıdaki kod). 
+
+JwtTokenService
+
+Filtre sırasını değiştir: HMAC → JWT → RateLimit; actuator’ı kilitle; CORS ekle. 
+
+SecurityConfiguration
+
+HMAC’e timestamp+replay koruması ekle.
+
+P1
+4. RateLimit’i route-aware + eviction (Caffeine) + dağıtık (Redis) opsiyonu. 
+
+RateLimitFilter
+
+
+5. JWT filtresinde geçersiz Bearer’a 401; auth/webhook path skip.
+
+P2
+6. Notification tarafında WebClient + resilience; UserDetails cache (gerekiyorsa).
+
+Bu adımları istersem doğrudan PR-taslak difflere dönüştürebilirim. Parser dosyasını paylaştığında onun için de aynı formatta (giriş→tespit→diff) ilerleyelim.
+
+
+
+--------------------------------------------
+
+
+
+
+Harika—parser’ı tek tek, kod seviyesinde didikledim. Aşağıya güçlü yanları, eksikler/riskler, önerilen iyileştirmeler (patch fikirleri ve snippet’lerle), performans/observability ve test planını bıraktım. Mesafe alırken satır içi referansları ekledim.
+
+Genel Değerlendirme (özet)
+
+Doğru yaklaşım: DTO → Domain dönüşümü tek bir merkezî sınıfta; event türlerini ayrı parse metotlarına bölmüşsünüz. Bu okunabilirlik ve sorumluluk ayrımı için iyi. 
+
+ChainhookPayloadParser
+
+Eksik/riski yüksek noktalar:
+
+Nonce hiç parse edilmiyor, 0’a sabitlenmiş (yanlış veri). 
+
+ChainhookPayloadParser
+
+indexBlockHash, blockHash ile aynı atanıyor (muhtemelen veri modeli anlamı kaçıyor). 
+
+ChainhookPayloadParser
+
+Contract call “args” alanını Map varsayıyorsunuz; Chainhook/Stacks tarafında çoğu zaman liste/karma yapı olur → ClassCast riski ve veri kaybı. 
+
+ChainhookPayloadParser
+
+Miktar alanlarında BigDecimal kullanımı (çoğu yerde tamsayı/micro birim; BigInteger + ölçek daha doğru). 
+
+ChainhookPayloadParser
+
+Asset identifier’dan contract çıkarımı kırılgan (substring lastIndexOf yerine güvenli split). 
+
+ChainhookPayloadParser
+
+Başarısız parse’larda sessiz “0/NULL” fallback (gizli veri bozulması/yanlış alarmlar). 
+
+ChainhookPayloadParser
+
+Event/Tx type mapping string switch ile dağınık; enum/harita tabanlı tek noktada çözüm daha güvenli. 
+
+ChainhookPayloadParser
+
+Aşağıda detaylar ⬇️
+
+Güçlü Yönler
+
+Sorumluluk ayrımı net: parseBlock, parseTransaction, parseEvent ve event-türü bazlı yardımcılar mantıklı ayrılmış. Bu, test yazmayı da kolaylaştırır. 
+
+ChainhookPayloadParser
+
+Event türleri kapsamlı: FT/NFT/STX transfer/mint/burn/lock ve smart contract log desteklenmiş. 
+
+ChainhookPayloadParser
+
+Decoded/Raw saklama: Print/contract log için decoded JSON ve raw değeri birlikte tutmanız ileriye dönük kural motoru için esnek. 
+
+ChainhookPayloadParser
+
+Kritik Eksikler ve Riskler (öncelik sırasıyla)
+P0 — Doğruluk / Veri Kaybı
+
+Nonce 0’a sabitleniyor (yanlış)
+Durum: transaction.setNonce(0L); DTO’da varsa alınmıyor. 
+
+ChainhookPayloadParser
+
+
+Etkisi: Cüzdan/sequence analizi, “address activity” kuralları ve idempotency analizleri yanıltılır.
+Öneri/Patch: DTO’da nonce varsa al; yoksa null bırak.
+
+// içinde
+if (metadata.getNonce() != null) {
+    transaction.setNonce(metadata.getNonce().longValue());
+}
+
+
+(DTO adlarını kendi gerçek DTO’nuzla eşleştirin.)
+
+indexBlockHash = blockHash atanıyor (model semantiği bozulabilir)
+Durum: setIndexBlockHash(identifier.getHash()). 
+
+ChainhookPayloadParser
+
+
+Risk: İki farklı alan aynı değere dönüyor; ileride index-chain korelasyonu/rollback analizlerinde sorun.
+Öneri: DTO’da ayrı alan varsa onu kullanın; yoksa alanı boş bırakın veya doğru kaynaktan doldurun.
+
+Contract call “args” tip varsayımı (Map) → ClassCast/Veri kaybı
+Durum: Map<String,Object> args = (Map<String,Object>) data.get("args"); 
+
+ChainhookPayloadParser
+
+
+Gerçeklik: Argümanlar çoğunlukla List ve Clarity tipleri; karma yapı.
+Öneri/Patch: Object saklayın (JSONB) ve tip güvenliğini üst katmanda yapın.
+
+Object args = data.get("args"); // Map/List/String olabilir
+contractCall.setFunctionArgsRaw(args); // JSONB(Object) alanı
+
+
+Veya Jackson ile JsonNode saklayın; kural motorunda JSONPath ile değerlendirin.
+
+Miktar alanları BigDecimal (tamsayı micro birimler için yanlış tercih olabilir)
+Durum: Sayı parse hatasında sessizce BigDecimal.ZERO dönüyor. 
+
+ChainhookPayloadParser
+
+
+Risk: Yanlış/eksik event verisi “0” gibi görünür → sahte alarm/susturma.
+Öneri:
+
+STX/FT miktarlarını BigInteger olarak saklayın (ham micro birim).
+
+İnsan-okunur gösterim için UI/raporda ölçek uygulayın.
+
+Parse hatasında exception veya explicit error flag dönün; “0” yapmayın.
+
+Asset identifier parsing kırılgan (split yerine substring)
+Durum: lastIndexOf("::") ile kesiliyor. 
+
+ChainhookPayloadParser
+
+
+Öneri:
+
+String[] parts = assetId.split("::", 2);
+if (parts.length == 2) event.setContractIdentifier(parts[0]);
+
+P1 — Bakım/Temiz Kod
+
+Event/Tx type mapping string switch
+Durum: String bazlı switch’ler. 
+
+ChainhookPayloadParser
+
+
+Öneri: TransactionType.fromWireType(String) ve EventType.fromWireType(String) gibi tek noktadan mapping; geriye kalan kod enum kullanır.
+
+Null/boş veri için sessiz fallback
+Durum: Hatalı sayı parse → ZERO; eventType/data null → sadece warn ve atla. 
+
+ChainhookPayloadParser
+
+ 
+
+ChainhookPayloadParser
+
+
+Öneri: “Strict mode” bayrağı ekleyin: Prod’da reject/metrics, Dev’de warn. Observability’de say.
+
+Kronometre/Clock bağımlılığı
+Öneri: Parser doğrudan zaman üretmiyor ama ileride tarih üretirse Clock enjekte edin (test edilebilirlik).
+
+Kullanılmayan import (EventType)
+Öneri: Temizleyin. 
+
+ChainhookPayloadParser
+
+P2 — Genişletilebilirlik/Performans
+
+JSONPath/Şart değerlendirme ihtiyacı
+Print/smart contract log için ileri seviye eşleme kuralı gerekecek → Parser JsonNode saklasın; eşleme katmanı JSONPath’le çalışsın. 
+
+ChainhookPayloadParser
+
+Events listesi büyüklüğü biliniyorsa capacity
+Öneri: new ArrayList<>(eventDtos.size()) (mikro kazanç). 
+
+ChainhookPayloadParser
+
+Önerilen Patch’ler (hedef: doğruluk + güvenlik + test edilebilirlik)
+1) Tip-güvenli mapping (enum factory)
+public enum WireTxType {
+  CONTRACTCALL, CONTRACTDEPLOYMENT, TOKENTRANSFER, COINBASE, POISONMICROBLOCK, UNKNOWN;
+
+  public static TransactionType toDomain(String wire) {
+    if (wire == null) return TransactionType.UNKNOWN;
+    return switch (wire.toUpperCase()) {
+      case "CONTRACTCALL" -> TransactionType.CONTRACT_CALL;
+      // ...
+      default -> TransactionType.UNKNOWN;
+    };
+  }
+}
+
+
+Parser’da sadece TransactionType = WireTxType.toDomain(kindType) kullanın. (Kaynak: mevcut switch’i merkezi hâle getiriyoruz.) 
+
+ChainhookPayloadParser
+
+2) Nonce ve fee/amount alanları
+// nonce
+if (metadata.getNonce() != null) {
+  transaction.setNonce(metadata.getNonce().longValue());
+} else {
+  transaction.setNonce(null);
+}
+
+// amounts: mümkünse BigInteger tutun, parse hatasında exception/log + skip
+private BigInteger getBigIntegerValue(Map<String,Object> data, String key) {
+  Object v = data.get(key);
+  if (v == null) return null;
+  try { return new BigInteger(v.toString()); }
+  catch (NumberFormatException e) { throw new ParseException("Invalid integer for "+key); }
+}
+
+
+(Bu yaklaşım “sessiz sıfır” riskini kaldırır.) 
+
+ChainhookPayloadParser
+
+3) Contract args güvenli saklama
+Object args = data.get("args"); // Map/List/JsonNode olabilir
+contractCall.setFunctionArgsRaw(args); // domain'i JSONB(Object/JsonNode)
+
+
+ChainhookPayloadParser
+
+4) Asset identifier split
+String assetId = toStringSafe(data.get("asset_identifier"));
+if (assetId != null) {
+  String[] parts = assetId.split("::", 2);
+  if (parts.length == 2) event.setContractIdentifier(parts[0]);
+}
+
+
+ChainhookPayloadParser
+
+5) indexBlockHash düzeltmesi
+// Eğer DTO’da ayrı bir index_block_hash alanı varsa onu kullanın:
+block.setIndexBlockHash(blockEventDto.getIndexBlockHash());
+// Yoksa bu alanı boş bırakın ya da farklı veri kaynağından doldurun.
+
+
+Şu an aynı hash’i yazmak semantik olarak hatalı görünüyor. 
+
+ChainhookPayloadParser
+
+Observability (gözlemlenebilirlik)
+
+ParseError metriği: event/tx parse hatalarını Counter ile tutun (Prometheus Micrometer).
+
+Strict/Lenient modu: Prod’da hatalı alan → “reject & dead-letter”; Dev’da “warn & skip”.
+
+Trace alanları: event index, txId, blockHeight log context’inde var; iyi. Bunu parse hatalarında da structured log’la (key=value) tutun. 
+
+ChainhookPayloadParser
+
+Performans
+
+Parser CPU-bound, GC dostu. Mikro optimizasyonlar (ArrayList capacity) dışında darboğaz değil. Büyük JSON “rawTx/rawResult” saklarken DB boyutuna dikkat edin (kompresyon veya arşiv tablosu). 
+
+ChainhookPayloadParser
+
+Test Planı (hemen yazılmalı)
+
+Golden fixtures: Gerçek Chainhook örnekleriyle (success/fail, STX/FT/NFT/print/lock).
+
+Property-based tests: Boş/missing alanlar, farklı türlerde “args”, uç değer miktarlar.
+
+Negative tests: Hatalı sayı/string → exception/log ve “skip” davranışı.
+
+Reorg entegrasyonu: Parser + ProcessChainhookPayloadUseCase birlikte; rollback senaryosunda deleted işaretleri (bu kısım use-case’de, parser bu flag’i false’a setliyor). 
+
+ChainhookPayloadParser
+
+Sonuç / Yol Haritası (Parser özelinde)
+
+P0 (hemen): Nonce parse, indexBlockHash doğru kaynak, args tipi emniyeti, amount’lar için doğru tip ve “sessiz sıfır”ı kaldır.
+
+P1: Enum factory ile type mapping’i merkezileştir; split ile contract extraction; structured parse hata yönetimi.
+
+P2: JSONPath destekli kural motoru için JsonNode saklama; Micrometer metrikleri; minor perf iyileştirmeler.
+
+İstersen bu noktada Parser için bir PR-taslak diff hazırlayıp (yukarıdaki 5 maddelik P0’ı kapsayan) commit-by-commit ilerleyeyim; sonra Infrastructure’daki diğer parçalara (config → filters → security) ve Application katmanına geçeriz.
+
+
+
+--------------------------------------------
+
+
+
+süper—value object (enum) setini tek tek inceledim. ama sadece “isimler doğru mu?” kontrolü yapmadım; ileride büyüme, kabiliyet eşleme ve üretim-dayanıklılığı açısından nerede sorun çıkarabileceklerini de çıkardım. her enum için: doğru taraflar → riskler/eksikler → somut öneriler (+ küçük patch örnekleri) veriyorum. en sonda da 2 küçük yeni enum (gerçekten işe yarayacak) öneriyorum.
+
+Hızlı özet (genel)
+
+Güzel taraf: Hepsi sade, EnumType.STRING ile kullanıldığını görüyoruz (ör. AlertRule’da). İsimlendirme mantıklı; AlertRuleType ↔ alt sınıfların @DiscriminatorValue’ları birbiriyle uyumlu.
+
+Ana açıklar:
+
+Forward-compatibility yok: zincirde yeni tip gelirse IllegalArgumentException/null riski → UNKNOWN sentinel eksik.
+
+Merkezî “wire → domain” dönüştürme yok: Parser’da string-switch dağınık; tek noktadan (fromWire) çözmek daha güvenli.
+
+Kabiliyet eşleme (hangi rule, hangi event’i destekler) enum seviyesinde yok → eşleştirme motoruna her seferinde “full scan” yaptırıyor.
+
+Bazı alanlar string listesi ile tutuluyor (ör. address activity types) → enum ile tip güvenliği daha iyi.
+
+Tek tek dosyalar
+1) AlertRuleType
+
+Doğru:
+
+Temel kurallar kapsanmış: CONTRACT_CALL, TOKEN_TRANSFER, FAILED_TRANSACTION, PRINT_EVENT, ADDRESS_ACTIVITY.
+
+Risk/Eksik:
+
+“Kural ↔ olay” uyumu enum’da encode edilmemiş. Örn. TOKEN_TRANSFER hangi EventType setini kapsıyor (FT/NFT/STX) belirsiz; bu yüzden eşleştirme full-scan’e kayıyor.
+
+Gelecekte yeni kural tipi eklendiğinde service tarafında unutulur/dağılır (dağınık if/switch).
+
+Öneri (küçük ama etkili):
+
+Enum’a kabiliyet haritası koy (hangi EventType’ları dinler?), böylece AlertMatching aday filtresi çok hızlanır.
+
+public enum AlertRuleType {
+  CONTRACT_CALL(EnumSet.noneOf(EventType.class)),
+  TOKEN_TRANSFER(EnumSet.of(
+      EventType.FT_TRANSFER, EventType.NFT_TRANSFER, EventType.STX_TRANSFER)),
+  FAILED_TRANSACTION(EnumSet.noneOf(EventType.class)),
+  PRINT_EVENT(EnumSet.of(EventType.SMART_CONTRACT_EVENT)),
+  ADDRESS_ACTIVITY(EnumSet.noneOf(EventType.class));
+
+  private final Set<EventType> supportedEvents;
+  AlertRuleType(Set<EventType> supportedEvents) { this.supportedEvents = supportedEvents; }
+  public boolean supports(EventType e) { return supportedEvents.contains(e); }
+}
+
+
+Not: Bu, aday kural indeksleri kurarken doğrudan kullanılabilir.
+
+2) AlertSeverity
+
+Doğru:
+
+INFO, WARNING, CRITICAL sade ve yeterli.
+
+Risk/Eksik:
+
+Sıralama/öncelik belirleme hep dışarıda tekrar yazılacak. “Grafik/renk/müşteri bildirim seviyesi” gibi mapping’ler yine dışarıda dağılır.
+
+Öneri:
+
+Ağırlık/öncelik ve default TTL/cooldown gibi yardımcılar ekle (opsiyonel ama pratik):
+
+public enum AlertSeverity {
+  INFO(1), WARNING(2), CRITICAL(3);
+  private final int weight;
+  AlertSeverity(int w){this.weight=w;}
+  public int weight(){ return weight; }
+  public boolean higherOrEq(AlertSeverity other){ return this.weight>=other.weight; }
+}
+
+3) EventType
+
+Doğru:
+
+FT/NFT/STX transfer/mint/burn/lock ve SMART_CONTRACT_EVENT kapsanmış (print/log). Bu, Stacks Chainhook olay modelini yeterince karşılıyor.
+
+Risk/Eksik:
+
+UNKNOWN sentinel yok → Chainhook yeni bir event verdiyse parser’da patlar.
+
+Asset türünü (FT/NFT/STX/LOG) ayırt etmek için her yerde switch yazılır; ortak fonksiyon yok.
+
+Öneri:
+
+UNKNOWN ekle, “wire→domain” tek noktada:
+
+Kolaylaştırıcılar: isTransfer(), assetKind() gibi.
+
+public enum EventType {
+  FT_MINT, FT_BURN, FT_TRANSFER,
+  NFT_MINT, NFT_BURN, NFT_TRANSFER,
+  STX_TRANSFER, STX_MINT, STX_BURN, STX_LOCK,
+  SMART_CONTRACT_EVENT,
+  UNKNOWN;
+
+  public static EventType fromWire(String s) {
+    if (s==null) return UNKNOWN;
+    return switch (s.toUpperCase()) {
+      case "FT_MINT" -> FT_MINT; /* ... diğerleri ... */
+      default -> UNKNOWN;
+    };
+  }
+
+  public boolean isTransfer(){
+    return this==FT_TRANSFER || this==NFT_TRANSFER || this==STX_TRANSFER;
+  }
+}
+
+
+Bu basit yardımcılar eşleştirme ve raporlamayı çok sadeleştirir.
+
+4) NotificationChannel
+
+Doğru:
+
+EMAIL, WEBHOOK minimalist ama MVP için yeterli.
+
+Risk/Eksik:
+
+Yol haritasında Slack/Telegram/Discord gibi kanallar gerekebilir.
+
+Her kanalın gerektirdiği hedef (email listesi, webhook URL) ve güvenlik gereği farklı; bu bilgi şu an dağınık.
+
+Öneri:
+
+Genişlemeye uygun yap (şimdiden “metaveri” accessor’ları).
+
+Basit yardımcılar ekle:
+
+public enum NotificationChannel {
+  EMAIL, WEBHOOK; // SLACK, TELEGRAM ... sonra eklenir
+
+  public boolean requiresAddressList() { return this==EMAIL; }
+  public boolean requiresWebhookUrl() { return this==WEBHOOK; }
+}
+
+
+Bu sayede “kural doğrulama” sırasında eksik config’i daha erken yakalarsın.
+
+5) NotificationStatus
+
+Doğru:
+
+PENDING, SENT, FAILED temel yaşam döngüsü.
+
+Risk/Eksik:
+
+Retry ve DLQ (dead-letter)’lı üretim senaryosunda ara durumlar gerekebilir: RETRYING, DEAD_LETTER.
+
+Gözlemlenebilirlikte “ilk deneme zamanı”, “son hata”, “attemptCount” gibi alanlar enum’la değil, entity’de ama durum seti bunu desteklemeli.
+
+Öneri:
+
+İleride eklenecekse planı şimdiden belirt; şimdilik mevcut set yeterli. Eğer retry sistemini hemen ekleyeceksen:
+
+public enum NotificationStatus { PENDING, RETRYING, SENT, FAILED, DEAD_LETTER }
+
+6) TransactionType
+
+Doğru:
+
+TOKEN_TRANSFER, SMART_CONTRACT, CONTRACT_CALL, POISON_MICROBLOCK, COINBASE, TENURE_CHANGE seti Stacks için makul.
+
+Risk/Eksik:
+
+UNKNOWN sentinel yok; yeni bir chain türü gelirse mapping patlar.
+
+Parser’da string switch dağınık (daha önce konuştuk).
+
+Öneri:
+
+UNKNOWN ekle + tek noktadan fromWire(String); ayrıca kolaylaştırıcı: isContractLike(), isUserAction():
+
+public enum TransactionType {
+  TOKEN_TRANSFER, SMART_CONTRACT, CONTRACT_CALL, POISON_MICROBLOCK, COINBASE, TENURE_CHANGE,
+  UNKNOWN;
+
+  public static TransactionType fromWire(String s){
+    if (s==null) return UNKNOWN;
+    return switch (s.toUpperCase()) {
+      case "TOKEN_TRANSFER" -> TOKEN_TRANSFER; /* ... */
+      default -> UNKNOWN;
+    };
+  }
+  public boolean isContractLike(){ return this==SMART_CONTRACT || this==CONTRACT_CALL; }
+}
+
+7) UserRole
+
+Doğru:
+
+USER, ADMIN basit ve yeterli.
+
+Risk/Eksik:
+
+Spring Security’de otorite isimleri genelde ROLE_*. Kodda map’leniyorsa sorun yok, ama bazen UI/API’de “authority” olarak direkt enum kullanılıyor ve prefix unutulabiliyor.
+
+Öneri:
+
+Küçük yardımcı:
+
+public String asAuthority(){ return "ROLE_" + name(); }
+
+
+İleride “audit-only”, “ops” gibi ara roller gerekirse genişletilebilir.
+
+Küçük ama değerli 2 yeni enum önerisi
+
+AddressActivityType (AddressActivityAlertRule’daki List<String> yerine)
+
+public enum AddressActivityType { SENDER, RECIPIENT, CONTRACT_DEPLOYER }
+
+
+Tip güvenliği, autocomplete, validasyon. Kural formunda kullanıcıdan gelen string’i fromString ile maplersin.
+
+AssetKind (FT/NFT/STX ayrımı gereken yerlerde)
+
+public enum AssetKind { FT, NFT, STX, UNKNOWN }
+
+
+EventType.assetKind() gibi yardımcı ile tek yerde tanımlarsın. “Token transfer kuralı sadece FT/NFT” gibi filtreler çok basitleşir.
+
+Patch/PR taslağı (özet diffl er)
+
+EventType ve TransactionType’a UNKNOWN + fromWire(String) + yardımcılar.
+
+AlertRuleType’a supports(EventType) (veya boş set) ekle.
+
+NotificationChannel’a requires* yardımcıları.
+
+(İsteğe bağlı) AddressActivityType ve AssetKind yeni enum’ları ekle;
+
+AddressActivityAlertRule.activityTypes: List<String> → List<AddressActivityType> migrasyonu (DB JSONB’de string dizisi kalabilir; serialize/deser’ı enum’a çevir).
+
+DB tarafı: Enum değerlerini String olarak sakladığın için yeni UNKNOWN/yeni enum’lar migration’a kırıcı etki yapmaz. Sadece backend mapping’i güncellemek yeterli.
+
+Neden şimdi yapalım?
+
+Parser & matching tarafında konuştuğumuz “aday indeksleme” ve “tek noktadan mapping” adımları enum’larda yardımcı fonksiyonlar olduğunda çok daha temiz/yanlışsız uygulanıyor.
+
+UNKNOWN sentinel’leri, zincir/SDK tarafında yeni tip gelince gece patlamayı engeller: logla, metrikle, ama sistemi ayakta tut.
+
+AddressActivityType dönüşümü, string-list kaynaklı sessiz yazım hatalarını (ör. “RECIEPIENT”) tamamen ortadan kaldırır.
+
+istersen bu değişiklikleri tek PR altında (saf enum refactor) çıkarayım; ardından Parser ve AlertMatchingService’teki fromWire() + supports(EventType) entegrasyonunu ikinci PR’da bağlarız. bu sırayla gittiğimizde risk düşük, kazanım yüksek olur.
+
+
+
+
+
+--------------------------------------------
+
+
+
+
+AlertRuleRepository
+Neler iyi
+
+“aktif kuralları bul”/“türe göre bul” gibi metotların varlığını (servislerden) görüyoruz; Single-table inheritance ile tek tablodan çekmek basit.
+
+Eksik/Risk
+
+Cooldown yarışına açık: isInCooldown() uygulama seviyesinde; DB tarafında koşullu güncelleme yok.
+
+Aday indeksleme yok: kontrat/asset/topic/adres gibi anahtarlarla ön-filtre yapacak sorgular tanımlı değil.
+
+Kural değişiminde cache invalidasyonunu tetikleyecek domain event/hook yok.
+
+P0 Öneriler (hemen)
+
+DB-tabanlı cooldown (yarışı kapat):
+
+public interface AlertRuleRepository extends JpaRepository<AlertRule, Long> {
+
+  @Query("select r from AlertRule r where r.isActive=true and r.ruleType=:type")
+  List<AlertRule> findActiveByRuleType(@Param("type") AlertRuleType type);
+
+  @Query("select r from AlertRule r where r.isActive=true")
+  List<AlertRule> findAllActive();
+
+  @Modifying
+  @Query("""
+    update AlertRule r
+       set r.lastTriggeredAt=:now, r.updatedAt=:now
+     where r.id=:id
+       and (r.lastTriggeredAt is null or r.lastTriggeredAt <= :windowStart)
+  """)
+  int markTriggeredIfOutOfCooldown(@Param("id") Long id,
+                                   @Param("now") Instant now,
+                                   @Param("windowStart") Instant windowStart);
+}
+
+
+Matching aşamasında tetiklemeyi bu metotla atomikle; dönüş 1 ise tetik, 0 ise cooldown.
+
+P1 Öneriler
+
+Aday kural sorguları (indeksleri de ekleyeceğiz):
+
+// PRINT_EVENT için kontrat+topic
+@Query("""
+  select r from PrintEventAlertRule r
+   where r.isActive=true
+     and (:cid is null or r.contractIdentifier=:cid)
+     and (:topic is null or r.eventKey=:topic)
+""")
+List<PrintEventAlertRule> findPrintRules(@Param("cid") String contractId,
+                                         @Param("topic") String eventKey);
+
+// CONTRACT_CALL için kontrat+fonksiyon
+@Query("""
+  select r from ContractCallAlertRule r
+   where r.isActive=true
+     and (:cid is null or r.monitoredContract.contractIdentifier=:cid)
+     and (:func is null or r.functionName=:func)
+""")
+List<ContractCallAlertRule> findContractCallRules(@Param("cid") String contractId,
+                                                  @Param("func") String functionName);
+
+// ADDRESS_ACTIVITY için adres
+@Query("""
+  select r from AddressActivityAlertRule r
+   where r.isActive=true
+     and lower(r.watchedAddress)=lower(:addr)
+""")
+List<AddressActivityAlertRule> findAddressRules(@Param("addr") String address);
+
+P2 Öneriler
+
+Kural create/update/delete’te @CacheEvict(allEntries=true) tetikleyen domain servis ekleyin.
+
+(Uzun vadede) JOINED strategy’ye migrasyon planı.
+
+AlertNotificationRepository
+Neler iyi
+
+Serviste save/saveAll kullanılıyor; basit CRUD akışı.
+
+Eksik/Risk
+
+Idempotency yok: aynı rule + tx + (event) + channel tekrar üretilebilir.
+
+Toplu güncelleme/durum geçişleri (PENDING→SENT/FAILED) için atomiklik eksik.
+
+“Rollback” halinde bildirimleri invalidate etme yolu yok.
+
+P0 Öneriler
+
+Unique constraint ve UPSERT stratejisi:
+
+Flyway’de (aşağıda) uk_notification_rule_tx_event_channel.
+
+Re-processing’te duplicate insert’leri yut.
+
+Repository tarafı:
+
+public interface AlertNotificationRepository extends JpaRepository<AlertNotification, Long> {
+
+  @Query("""
+    select n from AlertNotification n
+     where n.status='PENDING'
+     order by n.createdAt asc
+  """)
+  List<AlertNotification> findPending(Pageable pageable);
+
+  @Modifying
+  @Query("""
+    update AlertNotification n
+       set n.status=:status, n.sentAt=:sentAt, n.lastError=:err
+     where n.id in :ids
+  """)
+  int updateStatusBatch(@Param("ids") List<Long> ids,
+                        @Param("status") NotificationStatus status,
+                        @Param("sentAt") Instant sentAt,
+                        @Param("err") String lastError);
+
+  @Modifying
+  @Query("""
+    update AlertNotification n
+       set n.isInvalidated=true, n.updatedAt=:now
+     where n.transaction.block.id=:blockId
+  """)
+  int invalidateByBlockId(@Param("blockId") Long blockId,
+                          @Param("now") Instant now);
+}
+
+P1/P2
+
+P1: findByRuleIdAndTxIdAndEventIdAndChannel(...) ile ön kontrol.
+
+P2: Retry sayacı/artımsal backoff için alanlar ve batch metotlar (RETRYING/DEAD_LETTER).
+
+StacksBlockRepository
+Neler iyi
+
+findByBlockHash var (use-case’te görüyoruz).
+
+Eksik/Risk
+
+Reorg/rollback senaryolarında events/tx’lere birlikte erişmek için fetch ihtiyacı var.
+
+Son yükseklik/sıra sorguları eksik.
+
+Soft-delete varsa deleted=false filtresi/@Where koşulu yoksa kirli okuma riski.
+
+P0/P1
+public interface StacksBlockRepository extends JpaRepository<StacksBlock, Long> {
+
+  Optional<StacksBlock> findByBlockHash(String hash);
+
+  @EntityGraph(attributePaths = {"transactions","transactions.events"})
+  @Query("select b from StacksBlock b where b.blockHash=:hash")
+  Optional<StacksBlock> findByBlockHashWithTxAndEvents(@Param("hash") String hash);
+
+  @Query("select max(b.blockHeight) from StacksBlock b where b.deleted=false")
+  Optional<Long> findMaxHeight();
+
+  @Query("""
+    select b from StacksBlock b
+     where b.blockHeight between :from and :to and b.deleted=false
+     order by b.blockHeight asc
+  """)
+  List<StacksBlock> findRange(@Param("from") long from, @Param("to") long to);
+}
+
+StacksTransactionRepository
+Neler iyi
+
+findByTxId, findBySender(Pageable), findByTxType(Pageable), findBySuccess(Pageable), findByBlockId — servislerden gördük.
+
+Eksik/Risk
+
+existsByTxId var, güzel; ama “upsert” yok → apply’de yarım kalanları toparlama zor.
+
+Soft delete filtresi yoksa listeler rollback verisi döndürebilir.
+
+Arama/rapor için projection yok; ağır entity grafı taşınır.
+
+P0/P1
+
+Projections:
+
+public interface TxListView {
+  String getTxId();
+  Long getBlockId();
+  Boolean getSuccess();
+  Instant getAcceptedAt();
+  TransactionType getTxType();
+}
+
+@Query("""
+  select t.txId as txId, t.block.id as blockId, t.success as success,
+         t.acceptedAt as acceptedAt, t.txType as txType
+    from StacksTransaction t
+   where t.sender=:sender and t.deleted=false
+""")
+Page<TxListView> findBySenderLite(@Param("sender") String sender, Pageable p);
+
+boolean existsByTxId(String txId);
+
+
+(İsteğe bağlı) Postgres upsert (native, idempotency için):
+
+@Modifying
+@Query(value = """
+  insert into stacks_transaction(tx_id, block_id, sender, tx_type, success, accepted_at)
+  values (:txId, :blockId, :sender, :txType, :success, :acceptedAt)
+  on conflict (tx_id) do nothing
+""", nativeQuery = true)
+int insertIgnore(/* params */);
+
+TransactionEventRepository
+Neler iyi
+
+Olaylara doğrudan erişim sağlayan temel CRUD.
+
+Eksik/Risk
+
+Adres bazlı aktiviteleri bulmak için (RECIPIENT/SENDER) hızlı sorgular yok.
+
+(tx_id, event_index, event_type) unique kısıt olmadan duplicate riski.
+
+Token transferlerini raporlamak için projection eksik.
+
+P0/P1
+public interface TransactionEventRepository extends JpaRepository<TransactionEvent, Long> {
+
+  @Query("select e from TransactionEvent e where e.transaction.id=:txId order by e.eventIndex asc")
+  List<TransactionEvent> findByTransactionId(@Param("txId") Long txId);
+
+  // Address activity (recipient)
+  @Query("""
+    select e from FtTransferEvent e
+     where lower(e.recipient)=lower(:addr) and e.transaction.deleted=false
+     order by e.transaction.acceptedAt desc
+  """)
+  Page<FtTransferEvent> findFtIncoming(@Param("addr") String address, Pageable p);
+
+  // Index’leri desteklemek için event_type ve (tx_id,event_index) üzerinde kısıt önerisini Flyway’de ekliyorum.
+}
+
+ContractCallRepository / ContractDeploymentRepository
+Neler iyi
+
+Ayrık repository’ler olması okunurluk sağlıyor.
+
+Eksik/Risk
+
+“Kontrat + fonksiyon” hızlı arama, JSONB argüman filtresi yok.
+
+Index’e bağlanmayan string LIKE aramalar performans yakar.
+
+P1
+public interface ContractCallRepository extends JpaRepository<ContractCall, Long> {
+  @Query("""
+    select c from ContractCall c
+     where c.contractIdentifier=:cid and c.functionName=:fn
+       and c.transaction.deleted=false
+     order by c.transaction.acceptedAt desc
+  """)
+  Page<ContractCall> findByContractAndFunction(@Param("cid") String contractId,
+                                               @Param("fn") String functionName,
+                                               Pageable p);
+
+  // JSONB argümanlarında basit içerme (native, Postgres):
+  @Query(value = """
+    select * from contract_call
+     where contract_identifier=:cid
+       and function_name=:fn
+       and function_args_raw @> cast(:jsonb as jsonb)
+     order by created_at desc
+  """, nativeQuery = true)
+  Page<ContractCall> findByArgsContains(@Param("cid") String contractId,
+                                        @Param("fn") String functionName,
+                                        @Param("jsonb") String jsonbContains,
+                                        Pageable p);
+}
+
+MonitoredContractRepository
+Neler iyi
+
+Kullanıcı bazlı kontrat listeleri/tekil bulma ihtiyacı net.
+
+P0/P1
+public interface MonitoredContractRepository extends JpaRepository<MonitoredContract, Long> {
+
+  Optional<MonitoredContract> findByContractIdentifierAndUserId(String contractId, Long userId);
+
+  @Query("""
+    select m from MonitoredContract m
+     where m.user.id=:userId and m.isActive=true
+     order by m.createdAt desc
+  """)
+  Page<MonitoredContract> findActiveByUser(@Param("userId") Long userId, Pageable p);
+}
+
+UserRepository
+Neler iyi
+
+findByEmail ve enable/disable kontrolleri (security için) tipik.
+
+P0/P1
+public interface UserRepository extends JpaRepository<User, Long> {
+  Optional<User> findByEmailIgnoreCase(String email);
+
+  @Modifying
+  @Query("update User u set u.password=:hash, u.updatedAt=:now where u.id=:id")
+  int updatePassword(@Param("id") Long id, @Param("hash") String hash, @Param("now") Instant now);
+
+  boolean existsByEmailIgnoreCase(String email);
+}
+
+Flyway Migration Paketi (önerilen)
+
+1) Uniqueness & idempotency
+
+-- blocks
+create unique index if not exists uk_block_hash on stacks_block(block_hash);
+
+-- transactions
+create unique index if not exists uk_tx_id on stacks_transaction(tx_id);
+create index if not exists idx_tx_sender on stacks_transaction(lower(sender));
+create index if not exists idx_tx_type on stacks_transaction(tx_type);
+create index if not exists idx_tx_success on stacks_transaction(success);
+create index if not exists idx_tx_block on stacks_transaction(block_id);
+
+-- events
+alter table transaction_event add column if not exists event_index int;
+create unique index if not exists uk_event_tx_idx_type
+  on transaction_event(transaction_id, event_index, event_type);
+create index if not exists idx_event_type on transaction_event(event_type);
+
+-- notifications
+create unique index if not exists uk_notification_rule_tx_event_channel
+  on alert_notification(alert_rule_id, transaction_id, event_id, channel);
+create index if not exists idx_notification_pending on alert_notification(status) where status='PENDING';
+
+
+2) Kural aramaları için indeksler
+
+-- alert_rule
+create index if not exists idx_alert_rule_active on alert_rule(is_active);
+create index if not exists idx_alert_rule_type on alert_rule(rule_type);
+create index if not exists idx_alert_rule_contract on alert_rule(monitored_contract_id);
+create index if not exists idx_address_rule_watched on alert_rule(lower(watched_address))
+  where rule_type='ADDRESS_ACTIVITY';
+
+-- print event rule alt kolonu (eventKey)
+create index if not exists idx_print_rule_contract on alert_rule(contract_identifier)
+  where rule_type='PRINT_EVENT';
+create index if not exists idx_print_rule_topic on alert_rule(event_key)
+  where rule_type='PRINT_EVENT';
+
+-- contract_call
+create index if not exists idx_cc_contract_fn on contract_call(contract_identifier, function_name);
+
+-- JSONB için GIN (Postgres)
+create index if not exists gin_cc_args on contract_call using gin (function_args_raw jsonb_path_ops);
+
+
+3) Soft-delete destek indeksleri
+
+create index if not exists idx_block_deleted on stacks_block(deleted);
+create index if not exists idx_tx_deleted on stacks_transaction(deleted);
+create index if not exists idx_event_deleted on transaction_event(deleted);
+
+Test Planı (repo seviyesi)
+
+Idempotent insert: insertIgnore ile aynı tx_id iki kez gir → 1 satır.
+
+Cooldown yarış: iki thread markTriggeredIfOutOfCooldown → yalnızca biri 1 döner.
+
+Aday kural sorguları: kontrat+func/topic+adres için filtreli sorgular doğru alt küme döndürüyor mu?
+
+Rollback invalidation: blockId’ye bağlı tüm bildirimler isInvalidated=true oluyor mu?
+
+Projection: findBySenderLite yalnızca beklenen alanları döndürüyor mu?
+
+Kısa özet
+
+P0: DB-cooldown, notification idempotency + invalidate, block→tx→event fetch, projection’lar.
+
+P1: Aday kural sorguları (kontrat/func, kontrat+topic, adres), upsert kalıpları, JSONB GIN.
+
+P2: Temizleme/refactor (JOINED’e hazırlık, daha zengin retry durumları).
+
+İstersen bu önerileri 2–3 küçük PR’a böleyim:
+
+P0 – dayanıklılık/idempotency/cooldown (repo + Flyway)
+
+P1 – aday kural sorguları + indeksler
+
+P1/P2 – projection/JSONB GIN & optional upsert
+
+Hazırsan birincisini “diff” olarak çıkarıyorum; sonra service katmanında çağrı noktalarını bağlarız.
+
+
+
+--------------------------------------------
+
+
+
+1) AlertRule (base)
+ne iyi
+
+SINGLE_TABLE inheritance + @DiscriminatorColumn → operasyonel basitlik.
+
+@Version (optimistic lock) var → eşzamanlı güncellemeye temel.
+
+Cooldown alanı (cooldownMinutes) ve lastTriggeredAt → spam önleme için gerekli.
+
+Kanallar JSONB listesi → MVP’de esnek.
+
+sorun/riski yüksek
+
+cooldown uygulama seviyesinde: Şu an isInCooldown() + markAsTriggered() ile yönetiliyor. Eşzamanlı tetiklerde yarış mümkün (TOCTOU).
+
+mutable entity’yi cache’leme (AlertMatching tarafında) → lastTriggeredAt gibi alanlar cache’te “bayatlar”; çoklu instance’da tutarsızlık ve “çifte tetik” riski.
+
+notification hedefleri (notificationEmails, webhookUrl) string alanlar; validasyon/normalize eksik (email format, URL şeması).
+
+tenant sınırı: user alanı var ama repo/sorgu katmanında kullanıcı filtresi zorlanmazsa çok-kiracıda sızıntı riski.
+
+eşitlik/hash: id temelli (id != null && equals) kullanımı Hibernate’in tavsiye ettiği güvenli paterndir ama persist edilmemiş (id’siz) nesneler için eşitlik her zaman false → testlerde beklenmedik davranışlara hazır ol.
+
+öneri (P0 kritik → P1 önemli)
+
+P0 | DB-tabanlı cooldown: uygulama yerine koşullu UPDATE ile atomik tetikleme yap (AlertRuleRepository’de markTriggeredIfOutOfCooldown(...)); tetikleme akışında önce bu metodu çalıştır, dönüş 1 ise bildirim üret.
+
+P0 | cache’de snapshot: AlertMatching’de entity değil immutable snapshot DTO cache’le (kural id, tür, eşleşme predicateları, sabit alanlar). lastTriggeredAt gibi değişken alanlar cache’te tutulmasın.
+
+P1 | validasyon:
+
+@Email (listeyse splitter/normalizer), @URL (webhook) ya da custom validator.
+
+@NotBlank / @Size (ruleName ≤ 200 gibi).
+
+P1 | audit & enforce: rule create/update/delete servislerinde @CacheEvict(allEntries=true) + kullanıcı yetki kontrolü zorunlu.
+
+küçük patch (repo + servis tarafı):
+
+// AlertRuleRepository (özet)
+@Modifying
+@Query("""
+  update AlertRule r
+     set r.lastTriggeredAt=:now, r.updatedAt=:now
+   where r.id=:id
+     and (r.lastTriggeredAt is null or r.lastTriggeredAt <= :windowStart)
+""")
+int markTriggeredIfOutOfCooldown(Long id, Instant now, Instant windowStart);
+
+// AlertMatchingService (tetiklerken)
+int ok = alertRuleRepository.markTriggeredIfOutOfCooldown(rule.getId(), now, now.minusSeconds(rule.getCooldownMinutes()*60L));
+if (ok == 0) continue; // cooldown içi → yarış kapandı
+
+2) TokenTransferAlertRule
+gördüğüm alanlar/akış
+
+Alanlar: EventType eventType, String assetIdentifier, BigDecimal amountThreshold (≥).
+
+matches(context) içinde: instanceof TransactionEvent, eventType uyumu, assetIdentifier uyumu ve muhtemelen miktar eşik kontrolü (FT/NFT/STX transferleri için).
+
+sorun/eksik
+
+tek EventType ile sınırlama: token transfer evreni geniş (FT/NFT/STX). Kuralların çoğu birden fazla tip için geçerli olmak isteyebilir. Tek enum kısıtlayıcı; ayrıca yeni bir event geldiğinde (örn. farklı lock/tür) kırılgan.
+
+miktar tipi: BigDecimal doğru gibi görünse de zincirde miktarlar genelde tam sayı mikro birim (ör. uSTX). Zemin tipi BigInteger olmalı; gösterimde ölçek uygulamalısın. Aksi, yuvarlama/hassasiyet ve karşılaştırma hatası yaratabilir.
+
+adres filtreleri yok: çoğu kural sender/recipient veya “sadece incoming/outgoing” kısıtları ister.
+
+assetIdentifier parse kırılganlığı: “<contract>::<asset>” split’i güvenli yapılmazsa (case/format) kaçırır.
+
+aday seçim: şimdilik tüm TOKEN_TRANSFER kurallarını tarıyorsun → skala büyüyünce O(k).
+
+öneri (P0 → P1)
+
+P0 | eşik & tip düzeltmesi: miktarı domain’de BigInteger (raw units) olarak tut, eşik karşılaştırmasını orada yap; UI/DTO’da dönüştür.
+
+P1 | çoklu event türü: Set<EventType> eventTypes veya AssetKind (FT/NFT/STX) + isTransfer() yardımcıları.
+
+P1 | adres kısıtları: @Column sender, recipient opsiyonel alanları ekle; matches içinde ve aday indekste (adres→kural) kullan.
+
+P1 | aday indeksleme: assetIdentifier→kurallar ve/veya assetKind→kurallar map’i.
+
+mini patch fikri:
+
+// enum genişletme (önceki öneriyle tutarlı)
+public enum AssetKind { FT, NFT, STX, UNKNOWN }
+
+// kural alanları (örnek)
+private AssetKind assetKind;           // FT/NFT/STX
+@JdbcTypeCode(SqlTypes.JSON) 
+private Set<EventType> eventTypes;     // {FT_TRANSFER, NFT_TRANSFER ...}
+private String senderEquals;           // opsiyonel
+private String recipientEquals;        // opsiyonel
+private BigInteger amountThresholdRaw; // micro units
+
+
+testler
+
+FT incoming ≥ eşik → eşleşir; NFT aynı kuralda eşleşmez (kind filtresi).
+
+recipient=addr kısıtı sağlanmazsa eşleşmez.
+
+uSTX→STX dönüştürme hatası olmadan ham kıyas.
+
+3) ContractCallAlertRule
+mevcut
+
+Alanlar: contractIdentifier, functionName, amountThreshold (muhtemelen çağrıya ekli STX?).
+
+matches(Object) → ContractCall bekliyor; sözleşme ve fonksiyon adı eşleşmesi var.
+
+sorun/eksik
+
+amountThreshold semantiği belirsiz: contract call’da “miktar” hangi alan? “attached STX”? yoksa “argüman içindeki bir sayı”? Şu an belirsiz → kullanıcı yanılır.
+
+argüman eşleme yok: gerçek hayat kurallarının %80’i function args üzerinden gelir (ör. “receiver == X”, “amount ≥ 1_000_000”).
+
+aday seçim: kontrat+fonksiyon indekslenmemişse tüm kurallar taranır.
+
+öneri (P0 → P1)
+
+P0 | amountThreshold’ı tanımla: attached STX ise domain’de açık alan; argüman ise JSONPath ile değerlendirilecek “condition” bloğu ekleyin.
+
+P1 | args condition: kural alanı Map<String,Object> argConditions (JSONB) → AlertMatching’te JSONPath evaluator (Jayway) ile kontrol.
+
+P1 | aday indeks: contractIdentifier + functionName → kurallar.
+
+örnek condition
+
+{
+  "$.args[?(@.name=='receiver')].value": "SP3FBR2AGK8...", 
+  "$.args[?(@.name=='amount')].value": { "op": "gte", "value": 1000000 }
+}
+
+4) PrintEventAlertRule
+mevcut
+
+Alanlar: contractIdentifier, eventKey (topic).
+
+matches(Object) → SmartContractEvent bekliyor; kontrat+topic kontrolü var. dataConditions TODO (muhtemelen yok).
+
+sorun/eksik
+
+context tipi uyumu: SmartContractEvent, gerçekten TransactionEvent hiyerarşisinin altı mı? Değilse Matching instanceof yüzünden hiç tetiklemeyebilir (bunu daha önce yakalamıştık).
+
+payload şartı yok: print/log’lar için en kritik kısım payload filtreleri (JSONPath).
+
+aday seçim: kontrat+topic ile hızlı alt küme seçimi yoksa tüm PRINT_EVENT kurallarını tararsın.
+
+öneri (P0 → P1)
+
+P0 | tip uyumu: Domain event hiyerarşini netleştir; Matching’e doğru context’i geçir (gerekirse mapping adapter).
+
+P1 | JSONPath: dataConditions JSONB + küçük evaluator; eşlemede uygula.
+
+P1 | indeks: (contractIdentifier, eventKey) → rule indices; Matching’te aday kümesi buradan.
+
+5) FailedTransactionAlertRule
+mevcut
+
+Alanlar: contractIdentifier, functionName; matches → StacksTransaction ve !success.
+
+sorun/eksik
+
+hata nedeni yok: Stacks hata kodu/abort reason (vm error) filtren yoksa bildirim flood olur.
+
+retry/tekrar: failed tx’ler aynı block/tx için birden çok kez işlenirse tekrarlı bildirim (idempotency Notification’da çözülmeli).
+
+aday indeks: yok.
+
+öneri (P0 → P1)
+
+P0 | reason filter: errorCode, abortReason gibi alanlar (nullable) + contains/equals filtre.
+
+P1 | rate limit: kural başına maks. N bildirim/dk (rule-level throttle) ekleyebilirsin.
+
+P1 | indeks: kontrat+fonksiyon → kural ön-seçimi.
+
+6) AddressActivityAlertRule
+mevcut
+
+Alanlar: watchedAddress, List<String> activityTypes (SENDER/RECIPIENT/CONTRACT_DEPLOYER).
+
+matches(Object) → StacksTransaction ve şimdilik sadece SENDER kontrolü.
+
+sorun/eksik
+
+RECIPIENT & DEPLOYER yok (TODO).
+
+tip güvenliği: List<String> yanlış yazıma açık (“RECIEPIENT” gibi).
+
+adres formatı: Stacks adreslerinde farklı formatlar olabilir (case, c32).
+
+aday indeks: adres→kural map’i yoksa full scan.
+
+öneri (P0 → P1)
+
+P0 | tam kapsam: recipient (event’lerden çıkar), deployer (contract deploy tx).
+
+P0 | enum: List<AddressActivityType> (SENDER, RECIPIENT, CONTRACT_DEPLOYER).
+
+P1 | normalizasyon: adresi standardize et (lowercase, trim; gerekiyorsa c32 decode/encode) ve normalize edilmiş alanda karşılaştır.
+
+P1 | aday indeks: watchedAddress→rule listesi.
+
+7) MonitoredContract
+mevcut
+
+Alanlar: user, contractIdentifier, displayName, description, created/updated.
+
+equals/hashCode: “business key” notu var (muhtemelen user + contractIdentifier), ama dosyanın tamamını görmeden kesin konuşmayayım.
+
+sorun/eksik
+
+benzersizlik: (user_id, contractIdentifier) birleşik unique kısıt kesin olmalı (race’te çift kayıt).
+
+network/chain: Testnet/Mainnet ayrımı yoksa çakışmalar olur.
+
+pasif/aktif: isActive yoksa arşivleme/silme zor.
+
+görünen ad: kullanıcıya ait displayName benzersizliği gerekmese de uzunluk/karakter kısıtı gerekli.
+
+öneri (P0 → P1)
+
+P0 | unique: (user_id, contractIdentifier, network) composite unique.
+
+P1 | network alanı ekle (STACKS_MAINNET, STACKS_TESTNET).
+
+P1 | isActive`: arşivleme için.
+
+P1 | index: user_id, is_active ve lower(contractIdentifier).
+
+8) AlertNotification
+mevcut
+
+Alanlar: alertRule, transaction, event, channel, triggeredAt, message, status, sentAt, isInvalidated, failureReason, audit.
+
+sorun/eksik
+
+idempotency: aynı rule + tx + (event) + channel için duplicate üretim riski.
+
+retry metrikleri: attemptCount, lastErrorAt vb. yok.
+
+index: PENDING/SENT durumlarına göre hızlı tarama indeksleri olmalı.
+
+öneri (P0 → P1)
+
+P0 | unique: (alert_rule_id, transaction_id, event_id, channel) üzerine unique.
+
+P0 | hızlı sorgu: status (PENDING) kısmî indeks.
+
+P1 | retry: (opsiyonel) attemptCount, nextAttemptAt; circuit breaker/queue tarafına altyapı.
+
+9) User
+mevcut
+
+Alanlar: email, passwordHash, isEnabled, role/roller (tekil mi çoğul mu?), fullName, audit, monitoredContracts, alertRules.
+
+sorun/eksik
+
+@Email ve unique var mı? (idx_user_email unique var gibi anladım; yine de validasyon gerekli).
+
+role mapping: enum tek değer ise ileride birden fazla rol (ADMIN+OPS) için genişletme gerekir.
+
+parola: passwordHash güvenli (BCrypt); ama UserDetailsPasswordService ile hash yükseltme yoksa eski cost’lu hash’ler kalır.
+
+öneri (P0 → P1)
+
+P0 | validasyon: @Email, @NotBlank, @Size(min=8,…) (hash değil, plain parola için servis katmanı kontrolü).
+
+P1 | roller-set: Birden fazla rol ihtimali varsa @ElementCollection (veya join tablo). asAuthority() helper (ROLE_ prefix).
+
+Çapraz etkiler (çok önemli)
+
+Aday-indeksli eşleştirme:
+
+TokenTransferAlertRule: assetIdentifier / assetKind / sender / recipient → index & kural map
+
+ContractCallAlertRule: contractIdentifier + functionName → index & kural map
+
+PrintEventAlertRule: contractIdentifier + eventKey → index & kural map
+
+AddressActivityAlertRule: watchedAddress → index & kural map
+Bu, AlertMatching’te full scan yerine küçük aday kümeleri ile gerçek anlamda O(1)–O(log n) davranışa yaklaştırır.
+
+Idempotency zinciri:
+
+AlertNotification unique → duplicate bildirim yok.
+
+ProcessChainhookPayloadUseCase’te commit sonrası dispatch → hayalet bildirim yok.
+
+AlertRule cooldown’ı DB’de atomik → yarış biter.
+
+Doğru veri tipleri: miktarlar BigInteger/raw; UI’da dönüştür. Bu, yanlış alarmları keser.
+
+Flyway/Migration notları (özet)
+
+alert_notification unique: (alert_rule_id, transaction_id, event_id, channel)
+
+alert_rule indeks: (is_active), (rule_type), (monitored_contract_id); alt tip spesifik kolonlara partial index (örn. watched_address lower() where rule_type='ADDRESS_ACTIVITY')
+
+contract_call indeks: (contract_identifier, function_name); JSONB GIN (function_args_raw)
+
+monitored_contract unique: (user_id, contract_identifier, network)
+
+event & tx tarafında daha önce önerdiğim unique’ler (ör. (tx_id), (transaction_id,event_index,event_type))
+
+Test planı (domain + matching)
+
+TokenTransferAlertRule
+
+FT vs NFT vs STX ayrımı (assetKind) → doğru eşleşme.
+
+amountThreshold (raw) eşikleri → <, =, > sınır testleri.
+
+sender/recipient kısıtları → doğru hedefi eşler.
+
+ContractCallAlertRule
+
+contract+function eşleşir; args JSONPath koşulları (var-yok, sayı/string).
+
+PrintEventAlertRule
+
+contract+topic eşleşir; dataConditions (JSONPath) ile eq/gt/lt senaryolar.
+
+AddressActivityAlertRule
+
+SENDER/RECIPIENT/DEPLOYER ayrı ayrı; adres normalizasyonu (case farkı).
+
+AlertRule cooldown (repo)
+
+İki thread eşzamanlı tetik → sadece biri 1 döner; diğeri 0.
+
+AlertNotification idempotency
+
+aynı rule+tx+event+channel ile iki insert → 1 satır; ikinci deneme no-op.
+
+Örnek minimal difflere yakın yamalar
+
+AlertNotification tablosu için unique (DDL):
+
+alter table alert_notification
+  add constraint uk_notification_rtce unique (alert_rule_id, transaction_id, event_id, channel);
+create index if not exists idx_notification_pending on alert_notification (status) where status='PENDING';
+
+
+AddressActivityAlertRule enum’a geçiş (entity alanı):
+
+@JdbcTypeCode(SqlTypes.JSON)
+@Column(name = "activity_types", columnDefinition = "jsonb")
+private List<AddressActivityType> activityTypes; // String yerine enum
+
+
+TokenTransferAlertRule miktar (raw) ve adres kısıtları:
+
+@Column(name="amount_threshold_raw")
+private BigInteger amountThresholdRaw;
+
+@Column(name="sender_equals", length=64)
+private String senderEquals;
+
+@Column(name="recipient_equals", length=64)
+private String recipientEquals;
+
+Son söz / yol haritası (domain odaklı)
+
+P0 (hemen)
+
+AlertRule → DB cooldown akışı (repo metodu) + Matching’te kullan.
+
+AlertNotification → unique + PENDING index (idempotency).
+
+TokenTransferAlertRule → raw amount (BigInteger); assetId düzgün split; adres kısıtları.
+
+AddressActivityAlertRule → RECIPIENT/DEPLOYER desteğini tamamla + enum’a geç.
+
+P1
+5) ContractCallAlertRule → args condition (JSONPath); amountThreshold semantiğini netleştir.
+6) PrintEventAlertRule → JSONPath dataConditions + doğru context tipi; kontrat+topic index.
+7) MonitoredContract → unique (user, contract, network) + isActive ve network alanı.
+
+P2
+8) Rule’larda kabiliyet haritası (AlertRuleType.supports(EventType)) ve aday indeksleri (cache snapshot) ile AlertMatching’i O(1) aday seçime taşı.
+9) User/role genişletmeleri, validator’lar, projection/dto temizliği.
+
+hazırsan, bu P0 kalemlerini PR-taslağına çevirip (entity alanları, repository query’leri, migration DDL’leri ve küçük matching değişiklikleri dahil) parça parça çıkarayım. bir sonraki adımda application katmanındaki servis/use-case’lerle (özellikle AlertMatchingService ve ProcessChainhookPayloadUseCase) bu domain değişikliklerini drift yaratmadan bağlarız.
+
+
+
+
+--------------------------------------------
+
+
+
+
+
+mükemmel—bu paket (blockchain domain modelleri) sistemin “kalp atışı”. hepsini tek tek üretim gözüyle inceledim. her sınıf için: güçlü yönler → risk/eksik → önerilen düzeltmeler (P0/P1/P2 öncelik) → mini patch/snippet → test önerisi verdim. bazı yerlerde bilinçli şekilde eleştirel olacağım; amaç sağlam ve ölçeklenir bir çekirdek.
+
+1) ContractCall
+ne iyi
+
+StacksTransaction ile 1–1 ilişki kurulmuş; çağrı detaylarını ayrı varlıkta tutmak doğru.
+
+contractIdentifier + functionName ayrımı okunabilirlik sağlar.
+
+getFullIdentifier() (“contract::function”) pratik.
+
+risk/eksik
+
+İlişki modelleme: 1–1’de @MapsId yoksa gereksiz ek id sütunu ve join maliyeti oluşur. Tekil ilişkiyi aynı PK ile modellemek hem doğru hem hızlı.
+
+Fonksiyon argümanları: argümanlar çoğunlukla liste/karma JSON. Map/List varsayımı tip hatası doğurabilir. JSON metni/JsonNode saklamak daha güvenli.
+
+Arama performansı: contractIdentifier ve functionName üzerinde bileşik index yoksa sorgular ve aday-kural seçimi yavaşlar.
+
+Unique garanti: her transaction_id için tek ContractCall olmalı (unique constraint şart).
+
+öneriler
+
+P0
+
+@MapsId ile 1–1’i tek PK yap → ek join/ID gerekmez.
+
+functionArgsRaw alanını JSONB (JsonNode veya Object) sakla; tip dönüşümünü üst katman yap.
+
+(transaction_id) unique.
+
+P1
+
+(contract_identifier, function_name) bileşik index (sorgu ve eşleştirme için).
+
+(Ops.) attached STX miktarı varsa attachedAmountRaw (BigInteger/uSTX) ayır.
+
+mini patch
+
+@Entity
+@Table(name = "contract_call",
+       indexes = @Index(name="idx_cc_contract_fn", columnList="contract_identifier,function_name"),
+       uniqueConstraints = @UniqueConstraint(name="uk_cc_tx", columnNames="transaction_id"))
+@Getter @Setter
+public class ContractCall {
+  @Id private Long id;
+
+  @OneToOne(fetch=LAZY) @MapsId
+  @JoinColumn(name="transaction_id", nullable=false)
+  private StacksTransaction transaction;
+
+  @Column(name="contract_identifier", nullable=false, length=150)
+  private String contractIdentifier;
+
+  @Column(name="function_name", nullable=false, length=100)
+  private String functionName;
+
+  @JdbcTypeCode(SqlTypes.JSON)
+  @Column(name="function_args_raw", columnDefinition="jsonb")
+  private Object functionArgsRaw; // JsonNode/Object
+}
+
+
+test
+
+1–1 @MapsId ile aynı PK; ikinci insert aynı tx_id ile fail (unique).
+
+functionArgsRaw’a hem Map hem List hem string JSON ver → persist/deserialize problemsiz.
+
+2) ContractDeployment
+ne iyi
+
+Kaynak kod, ABI ve trait bilgisi tutuluyor; SIP-009/010 tespit yardımcıları güzel.
+
+risk/eksik
+
+Büyük alan tipleri: kaynak kod/ABI için CLOB/TEXT kullanımı ve boyut sınırı önemli.
+
+Trait listesi: JSONB saklamıyorsan esneklik kaybolur; case/versiyon eşleşmesi kırılgan.
+
+Benzersizlik: aynı ağda aynı contractIdentifier için unique gerek.
+
+Network ayrımı yoksa (mainnet/testnet) çakışma olur.
+
+Kod bütünlüğü: hash (SHA-256) saklamazsan deduplikasyon/spam zor.
+
+öneriler
+
+P0
+
+sourceCode/abiJson için @Lob + TEXT ve kontrol.
+
+contractIdentifier + network unique.
+
+P1
+
+traitImplementations JSONB (liste) + küçük helper implementsTrait(String).
+
+codeHash (sha256) sütunu (index).
+
+mini patch
+
+@Column(name="contract_identifier", nullable=false, length=150)
+private String contractIdentifier;
+
+@Column(name="network", nullable=false, length=16) // STACKS_MAINNET/TESTNET
+private String network;
+
+@Lob @Column(name="source_code", columnDefinition="TEXT", nullable=false)
+private String sourceCode;
+
+@Lob @Column(name="abi_json", columnDefinition="TEXT")
+private String abiJson;
+
+@JdbcTypeCode(SqlTypes.JSON)
+@Column(name="traits", columnDefinition="jsonb")
+private java.util.Set<String> traitImplementations;
+
+@Column(name="code_sha256", length=64)
+private String codeHash;
+
+
+test
+
+Aynı ağ+contractIdentifier ile ikinci kayıt fail (unique).
+
+implementsTrait("sip-010") doğru döner (case-insensitive).
+
+3) FT Event’leri (FTMintEvent, FTBurnEvent, FTTransferEvent)
+ne iyi
+
+Ayrık tablolar ve assetIdentifier, sender/recipient sütunları net.
+
+Tanımlayıcı getEventDescription() developer deneyimini artırır.
+
+risk/eksik
+
+Miktar tipi: BigDecimal yerine zincirde ham miktar BigInteger (raw, micro) olmalı. Decimal ölçek (UI’de) ayrı.
+
+Adres/asset normalize: eşleşmelerde case/format farkları sorun çıkarır.
+
+Benzersiz olay: aynı tx içinde event’leri (tx_id, event_index, event_type) ile unique yapmazsan duplicate olabilir.
+
+İlişki: tüm eventler TransactionEvent hiyerarşisini extend etmeli (id, eventIndex, eventType, transaction).
+
+öneriler
+
+P0
+
+amountRaw → BigInteger; UI dönüştürsün. (Decimalı bırakacaksan da ham değeri ek alan olarak sakla.)
+
+(transaction_id, event_index, event_type) unique; eventIndex non-null.
+
+sender/recipient üzerinde lower() indeks (case-insensitive aramalar için).
+
+P1
+
+assetIdentifier split güvenli (contract+asset); assetContractIdentifier alanı.
+
+@Where(deleted=false) ekosisteme uygunsa event tabanına da.
+
+mini patch
+
+@Column(name="asset_identifier", nullable=false, length=200)
+private String assetIdentifier;
+
+@Column(name="amount_raw", nullable=false, precision=0) // BigInteger via Hibernate
+private java.math.BigInteger amountRaw;
+
+@Column(nullable=false, length=50)
+private String sender;
+
+@Column(nullable=false, length=50)
+private String recipient;
+
+
+DDL
+
+alter table transaction_event add column if not exists event_index int not null;
+create unique index if not exists uk_event_tx_idx_type
+  on transaction_event(transaction_id, event_index, event_type);
+create index if not exists idx_event_sender_lower on ft_transfer_event (lower(sender));
+create index if not exists idx_event_recipient_lower on ft_transfer_event (lower(recipient));
+
+
+test
+
+Aynı tx + event_index ile ikinci ekleme fail.
+
+amountRaw kıyas testleri (eşik altında/üstünde).
+
+4) NFT Event’leri (NFTMintEvent, NFTBurnEvent, NFTTransferEvent)
+ne iyi
+
+assetClassIdentifier + rawValue (token id) alanları var; transfer/mint/burn ayrımı okunaklı.
+
+risk/eksik
+
+Token ID tipi: rawValue TEXT; çoğu durumda JSON/hex → domain’de hem ham değer hem normalize edilmiş tokenId (BigInteger ya da string) saklamak faydalı.
+
+Adres normalize ve index yoksa alıcı/gönderici aramaları pahalı.
+
+Benzersiz olay ve eventIndex aynı FT’deki gibi.
+
+öneriler
+
+P0
+
+(transaction_id, event_index, event_type) unique + eventIndex zorunlu.
+
+sender/recipient lower() indeksleri.
+
+P1
+
+tokenIdRaw + tokenIdNumeric (nullable) gibi iki alan (esneklik).
+
+assetClassIdentifier + tokenId üzerinde raporlama index’i.
+
+test
+
+Transfer → sender!=recipient, mint → sender null/özel, burn → recipient null/özel; kurallar bunlara dayanabiliyor mu?
+
+5) SmartContractEvent (print/log)
+ne iyi
+
+valueDecoded JSONB ve valueRaw TEXT ile zengin veri saklama imkânı var.
+
+topic alanı mevcut.
+
+risk/eksik
+
+Hiyerarşi uyumu: Bu sınıf TransactionEvent hiyerarşisini extend etmeli (aksi hâlde matching’te tip uyuşmazlığı).
+
+Indexleme: contractIdentifier + topic üzerinde index yoksa print-tabanlı kurallar yavaşlar.
+
+JSONPath şartları: ileride dataConditions ile eşleme yapacağız; JSON’ı JsonNode saklamak daha elverişli.
+
+öneriler
+
+P0
+
+superclass’ın TransactionEvent olduğundan emin ol; alanlar (eventIndex, transaction, eventType=SMART_CONTRACT_EVENT) net olsun.
+
+P1
+
+(contract_identifier, topic) üzerinde index.
+
+valueDecoded tipini JsonNode yap (opsiyon).
+
+mini patch
+
+@Entity
+@Table(name="smart_contract_event",
+       indexes = {
+         @Index(name="idx_sce_contract", columnList="contract_identifier"),
+         @Index(name="idx_sce_topic", columnList="topic")
+       })
+public class SmartContractEvent extends TransactionEvent {
+  @Column(name="contract_identifier", length=150)
+  private String contractIdentifier;
+
+  @Column(name="topic", length=100)
+  private String topic;
+
+  @JdbcTypeCode(SqlTypes.JSON)
+  @Column(name="value_decoded", columnDefinition="jsonb")
+  private Object valueDecoded;
+
+  @Column(name="value_raw", columnDefinition="TEXT")
+  private String valueRaw;
+}
+
+
+test
+
+Print event’ine JSONPath koşulu uygulandığında doğru eşleşiyor mu? (eşleme katmanında)
+
+6) StacksBlock
+ne iyi
+
+blockHash unique; indexBlockHash, parentBlockHash, timestamp gibi temel alanlar var.
+
+addTransaction yardımcı metodu graph tutarlılığı için güzel.
+
+markAsDeleted() ile reorg desteği.
+
+risk/eksik
+
+indexBlockHash semantiği: apply’de blockHash ile aynı yazılmamalı (daha önce yakalamıştık); doğru kaynaktan set edilmeli.
+
+Soft delete tamamlığı: sadece block işaretlenirse, ilişkili transaction/event işaretlenmezse veri tutarsız kalır. cascade soft-delete stratejisini netle.
+
+İlişki anotasyonları: @OneToMany(mappedBy="block", cascade=ALL, orphanRemoval=true) net olmalı (veya bilinçli olarak değilse neden).
+
+İndeksler: blockHeight, timestamp, deleted üzerinde index yoksa aralık ve sıralı okumalarda pahalı.
+
+öneriler
+
+P0
+
+Soft delete stratejisini tüm hiyerarşi için tamamla (block→tx→event). Domain event/serviste zincirleme işaretle.
+
+indexBlockHash doğru DTO’dan set edilsin; emin değilsen boş bırak.
+
+P1
+
+@Where(clause="deleted=false") (block/tx/event tarafında) veya Hibernate filter.
+
+Indexler: (block_height), (timestamp), (deleted).
+
+mini patch
+
+@OneToMany(mappedBy="block", cascade=CascadeType.ALL, orphanRemoval=true)
+private List<StacksTransaction> transactions = new ArrayList<>();
+
+@Column(name="deleted", nullable=false)
+private boolean deleted = false;
+
+@Column(name="deleted_at")
+private Instant deletedAt;
+
+public void markAsDeleted(){
+  this.deleted = true; this.deletedAt = Instant.now();
+  for (var tx : transactions){
+    tx.markAsDeleted(); // tx içinde events için de zincirleme
+  }
+}
+
+
+test
+
+Reorg: block.markAsDeleted() çağrısında tüm tx/event deleted=true.
+
+findMaxHeight()/range aramalar deleted=false filtreli.
+
+ortak mimari öneriler (bu pakete yönelik)
+veri tipleri ve normalize
+
+Miktarlar: FT/STX miktarları BigInteger raw sakla; UI/raporda ölçek uygula. Böylece precision/rounding sorunu, yanlış alarm riski kalkar.
+
+Adres/kimlikler: lower() normalize ederek sakla/ara; indexleri lower(column) üstünden tanımla. Gerekirse c32 dönüşümü için helper.
+
+eşsiz ve index stratejisi
+
+Event benzersizliği: (transaction_id, event_index, event_type) unique.
+
+Contract call: (transaction_id) unique, (contract_identifier, function_name) index.
+
+Print: (contract_identifier, topic) index.
+
+Arama: sender/recipient için lower() index.
+
+Block/Tx: block_hash unique, tx_id unique; block_height, timestamp, deleted indexleri.
+
+JPA/hibernate pratikleri
+
+equals/hashCode: id-tabanlı yaklaşım doğru; fakat testlerde transient nesneler için beklenmeyen sonuçlara dikkat.
+
+@EntityGraph/fetch join: sorgu tarafında N+1’i önlemek için noktasal kullan.
+
+@Version: Block/Tx’te de gerekebilir (yüksek concurrency’de).
+
+Flyway DDL (özet, bu paket için)
+-- benzersizlik ve arama
+create unique index if not exists uk_block_hash on stacks_block(block_hash);
+create index if not exists idx_block_height on stacks_block(block_height);
+create index if not exists idx_block_ts on stacks_block(timestamp);
+create index if not exists idx_block_deleted on stacks_block(deleted);
+
+create unique index if not exists uk_tx_id on stacks_transaction(tx_id);
+create index if not exists idx_tx_block on stacks_transaction(block_id);
+create index if not exists idx_tx_deleted on stacks_transaction(deleted);
+
+alter table transaction_event add column if not exists event_index int not null;
+create unique index if not exists uk_event_tx_idx_type
+  on transaction_event(transaction_id, event_index, event_type);
+create index if not exists idx_event_type on transaction_event(event_type);
+create index if not exists idx_ft_sender_lower on ft_transfer_event (lower(sender));
+create index if not exists idx_ft_recipient_lower on ft_transfer_event (lower(recipient));
+
+create index if not exists idx_sce_contract on smart_contract_event(contract_identifier);
+create index if not exists idx_sce_topic on smart_contract_event(topic);
+
+create index if not exists idx_cc_contract_fn on contract_call(contract_identifier, function_name);
+alter table contract_call add constraint uk_cc_tx unique (transaction_id);
+
+test planı (kritik senaryolar)
+
+ContractCall: aynı transaction için ikinci call insert hata (unique); farklı contract+function sorgular index kullanıyor.
+
+FT/NFT transfer: amountRaw sınır testleri; sender/recipient case-insensitive aramalar.
+
+SmartContractEvent: topic ve contract’a göre hızlı filtre; JSON value saklama/okuma.
+
+StacksBlock reorg: markAsDeleted zincirleme; deleted filtreli sorgular doğru çalışıyor.
+
+Event benzersizliği: aynı tx ve index ile ikinci ekleme engelleniyor.
+
+sonuç / kısa yönlendirme
+
+P0 (hemen): 1–1 @MapsId (ContractCall), BigInteger ham miktarlar (FT/STX), event benzersizliği ve eventIndex, soft delete zincirinin tamamlanması, gerekli unique/index’ler.
+
+P1: adres/asset normalize + lower() indexleri, contract/function ve print(topic) indeksleri, ContractDeployment’ta network+unique ve LOB alanlar, SmartContractEvent’te index ve (ops.) JsonNode.
+
+P2: domain snapshot + aday indeksleriyle Matching’i hızlandıracak alanlar (özellikle contract/asset/topic/addr anahtarları), genişletilebilir trait/ABI işleme.
+
+istersen bu P0 kalemlerini tek PR olarak DDL + küçük entity değişiklikleri halinde çıkarayım; ardından application katmanında (AlertMatching/ProcessChainhook) bu alanları kullanacak sorgu ve akış düzeltmelerine geçeriz.
+
+
+
+
+
+--------------------------------------------
+
+
+
+1) TransactionEvent (base)
+ne iyi
+
+Tek tip üst sınıf ile FT/NFT/STX/SMART_CONTRACT türevlerini ortak bir çatıya almış olmanız doğru.
+
+(Varsayıyorum) transaction ilişkisi var ve event türü için bir enum (EventType) kullanılıyor olması iyi bir temel.
+
+risk / eksik
+
+Benzersizlik ve sıralama
+
+eventIndex alanı yoksa ya da zorunlu değilse, aynı tx içinde duplicate event riski var; sıralama garanti değil.
+
+Soft delete zinciri
+
+Reorg/rollback destekliyorsanız event’lerde de deleted + deletedAt alanları olmalı; yoksa veri kirlenir.
+
+Hiyerarşi stratejisi
+
+Türe bağlı tablo (TPC/TPT/STS) seçiminiz net değilse performans kaybı olur. Çoğu projede SINGLE_TABLE veya JOINED iyi çalışır.
+
+Audit alanları
+
+createdAt/updatedAt yoksa değişikliklerin izlenmesi zorlaşır.
+
+Index stratejisi
+
+event_type, (transaction_id, event_index), deleted gibi indeksler yoksa taramalar pahalı.
+
+öneriler
+
+P0
+
+eventIndex (NOT NULL) + (transaction_id, event_index, event_type) unique kısıt.
+
+deleted (boolean) ve deletedAt ekleyin; rollback’te zincirleme işaretleme yapın.
+
+P1
+
+@EntityListeners(AuditingEntityListener.class) + @CreatedDate/@LastModifiedDate.
+
+@Inheritance(strategy = InheritanceType.SINGLE_TABLE) + @DiscriminatorColumn("event_type") (veya net seçtiğiniz strateji).
+
+mini patch
+
+@MappedSuperclass
+@Getter @Setter
+public abstract class TransactionEvent {
+  @Id @GeneratedValue private Long id;
+
+  @ManyToOne(fetch = FetchType.LAZY) 
+  @JoinColumn(name="transaction_id", nullable=false)
+  private StacksTransaction transaction;
+
+  @Enumerated(EnumType.STRING)
+  @Column(name="event_type", nullable=false, length=40)
+  private EventType eventType;
+
+  @Column(name="event_index", nullable=false)
+  private Integer eventIndex;
+
+  @Column(name="deleted", nullable=false)
+  private boolean deleted = false;
+
+  @Column(name="deleted_at")
+  private Instant deletedAt;
+
+  @CreatedDate @Column(name="created_at", updatable=false, nullable=false)
+  private Instant createdAt;
+
+  @LastModifiedDate @Column(name="updated_at")
+  private Instant updatedAt;
+}
+
+
+test plan (base)
+
+Aynı transaction_id + event_index + event_type ile ikinci insert hata vermeli.
+
+markAsDeleted() zincirleme işaretlendiğinde event de deleted=true.
+
+2) StacksTransaction
+ne iyi
+
+txId (unique olmalı), txType (enum), sender, success bayrağı ve block ilişkisi çekirdeği oluşturuyor.
+
+events ve (varsa) contractCall gibi alt varlıklarla ilişkiler anlamlı.
+
+risk / eksik
+
+Idempotency
+
+txId üzerinde unique kısıt yoksa duplicate tehlikesi.
+
+Yeniden işleme (re-delivery) durumları için upsert kalıbı gerekir.
+
+Soft delete
+
+Reorg’ta deleted/deletedAt yoksa sadece block işaretlenirse transactionlar kirli görünür.
+
+Nonce / Fee / Raw
+
+Nonce/fee gibi alanlar eksikse geçmişte tespit ettiğimiz parser default’ları (nonce=0) yanlış veriye yol açar.
+
+rawTx, rawResult gibi alanlar (TEXT/JSONB) yoksa debug zorlaşır.
+
+Zaman alanları
+
+acceptedAt (block zamanına eşleştirilen) ve receivedAt (webhook alınma zamanı) ayrı tutulmalı.
+
+İlişki eşleştirme yardımcıları
+
+addEvent(e) metodu eventIndex atamasını ve iki yönlü ilişkiyi sağlamazsa sırada kaymalar olabilir.
+
+Index
+
+block_id, sender(lower), success, tx_type, deleted indeksleri yoksa sorgular yavaşlar.
+
+öneriler
+
+P0
+
+txId unique.
+
+deleted + deletedAt.
+
+addEvent helper: event.setTransaction(this) + event.setEventIndex(nextIndex).
+
+P1
+
+nonce (Long), feeRaw (BigInteger), rawTx/rawResult (TEXT/JSONB).
+
+acceptedAt, receivedAt.
+
+Indexler: idx_tx_block, idx_tx_sender_lower, idx_tx_success, idx_tx_type, idx_tx_deleted.
+
+mini patch
+
+@Entity
+@Table(name="stacks_transaction",
+   uniqueConstraints=@UniqueConstraint(name="uk_tx_id", columnNames="tx_id"),
+   indexes = {
+     @Index(name="idx_tx_block", columnList="block_id"),
+     @Index(name="idx_tx_success", columnList="success"),
+     @Index(name="idx_tx_type", columnList="tx_type"),
+     @Index(name="idx_tx_deleted", columnList="deleted")
+   })
+@Getter @Setter
+public class StacksTransaction {
+  @Id @GeneratedValue private Long id;
+
+  @Column(name="tx_id", nullable=false, length=64)
+  private String txId;
+
+  @ManyToOne(fetch=FetchType.LAZY) 
+  @JoinColumn(name="block_id")
+  private StacksBlock block;
+
+  @Enumerated(EnumType.STRING)
+  @Column(name="tx_type", nullable=false, length=40)
+  private TransactionType txType;
+
+  @Column(name="sender", length=50)
+  private String sender;
+
+  @Column(name="success", nullable=false)
+  private Boolean success = Boolean.TRUE;
+
+  @Column(name="nonce") 
+  private Long nonce;
+
+  @Column(name="fee_raw") 
+  private BigInteger feeRaw;
+
+  @Column(name="deleted", nullable=false)
+  private boolean deleted = false;
+
+  @Column(name="deleted_at")
+  private Instant deletedAt;
+
+  @CreatedDate @Column(name="created_at", updatable=false, nullable=false)
+  private Instant createdAt;
+
+  @LastModifiedDate @Column(name="updated_at")
+  private Instant updatedAt;
+
+  @Column(name="accepted_at") private Instant acceptedAt;
+  @Column(name="received_at") private Instant receivedAt;
+
+  @OneToMany(mappedBy="transaction", cascade=ALL, orphanRemoval=true)
+  private List<TransactionEvent> events = new ArrayList<>();
+
+  public void addEvent(TransactionEvent e) {
+    e.setTransaction(this);
+    e.setEventIndex(events.size());
+    events.add(e);
+  }
+
+  public void markAsDeleted(){
+    this.deleted = true; this.deletedAt = Instant.now();
+    for (var e : events) { e.setDeleted(true); e.setDeletedAt(Instant.now()); }
+  }
+}
+
+
+test plan (tx)
+
+Aynı txId ile ikinci insert engellenir.
+
+addEvent sıralaması doğru (0..n-1) ve iki yönlü ilişki set edilir.
+
+markAsDeleted çağrısında tüm eventler işaretlenir.
+
+3) STXTransferEvent, STXMintEvent, STXBurnEvent, STXLockEvent
+ne iyi
+
+STX’e özgü operasyonları ayrı sınıflar halinde modellemek okunabilirliği artırır.
+
+Transfer için sender/recipient, lock için kilit parametreleri (unlock height/time) olması beklenir; doğru yönde.
+
+risk / eksik
+
+Miktar tipi
+
+STX miktarları zincirde microSTX tam sayı olarak modellenmeli. BigDecimal kullanımı precision/karşılaştırma hatası doğurur.
+
+Lock alanları
+
+unlockHeight ve/veya unlockTime alanlarının tipleri doğru mu? Negative/overflow korunmalı.
+
+Adres normalize + index
+
+Aramalar case-insensitive; lower() index yoksa ağır.
+
+Benzersizlik ve index
+
+Base’teki (transaction_id, event_index, event_type) unique burada da şart.
+
+öneriler
+
+P0
+
+amountRaw: BigInteger (zorunlu).
+
+unlockHeight: Long ve/veya unlockTime: Instant (Stacks semantiğine uygun).
+
+(transaction_id, event_index, event_type) unique.
+
+P1
+
+sender/recipient lower index.
+
+Lock için lockedUntil() helper (yüksek seviyeli API).
+
+mini patch
+
+@Entity
+@Table(name="stx_transfer_event")
+public class STXTransferEvent extends TransactionEvent {
+  @Column(name="amount_raw", nullable=false)
+  private BigInteger amountRaw;
+
+  @Column(name="sender", length=50, nullable=false)
+  private String sender;
+
+  @Column(name="recipient", length=50, nullable=false)
+  private String recipient;
+}
+
+@Entity
+@Table(name="stx_lock_event")
+public class STXLockEvent extends TransactionEvent {
+  @Column(name="amount_raw", nullable=false)
+  private BigInteger amountRaw;
+
+  @Column(name="unlock_height")
+  private Long unlockHeight;
+
+  @Column(name="unlock_time")
+  private Instant unlockTime;
+
+  public boolean isUnlockedAt(long height, Instant time) {
+    if (unlockHeight != null && height >= unlockHeight) return true;
+    if (unlockTime != null && !time.isBefore(unlockTime)) return true;
+    return false;
+  }
+}
+
+
+test plan (stx)
+
+Transfer: raw amount eşik testleri (eşleşme motoru için).
+
+Lock: belli bir height/time için isUnlockedAt doğru döner.
+
+Sender/recipient araması case-insensitive.
+
+4) “şemayı güçlendiren” DDL (Flyway) — bu paket özelinde
+-- transaction
+create unique index if not exists uk_tx_id on stacks_transaction(tx_id);
+create index if not exists idx_tx_block on stacks_transaction(block_id);
+create index if not exists idx_tx_success on stacks_transaction(success);
+create index if not exists idx_tx_type on stacks_transaction(tx_type);
+create index if not exists idx_tx_deleted on stacks_transaction(deleted);
+create index if not exists idx_tx_sender_lower on stacks_transaction (lower(sender));
+
+-- event base
+alter table transaction_event add column if not exists event_index int not null;
+alter table transaction_event add column if not exists deleted boolean not null default false;
+alter table transaction_event add column if not exists deleted_at timestamptz;
+create unique index if not exists uk_event_tx_idx_type
+  on transaction_event(transaction_id, event_index, event_type);
+create index if not exists idx_event_type on transaction_event(event_type);
+create index if not exists idx_event_deleted on transaction_event(deleted);
+
+-- stx transfer
+create index if not exists idx_stx_sender_lower on stx_transfer_event (lower(sender));
+create index if not exists idx_stx_recipient_lower on stx_transfer_event (lower(recipient));
+
+-- contract call
+alter table contract_call add constraint uk_cc_tx unique (transaction_id);
+create index if not exists idx_cc_contract_fn on contract_call(contract_identifier, function_name);
+
+5) Uygulamada etkisi (neden şimdi?)
+
+Idempotency & doğruluk: txId unique + event unique kısıtları, re-delivery ve yarış durumlarını güvenli hale getirir.
+
+Performans: doğru indeksler ve lower() indeksleri arama/rapor eşiklerini ciddi hızlandırır.
+
+Reorg sağlamlığı: soft delete zinciri ile “kirli veri” ve yanlış alarmlar önlenir.
+
+Eşleşme motoru: eventIndex, amountRaw, sender/recipient normalize → kural eşleştirme O(1) aday seçimine (önceki öneriler) taşınabilir.
+
+6) Test planı (entegre)
+
+Idempotent işleme
+
+Aynı payload iki kez işlendiğinde stacks_transaction.uk_tx_id ve transaction_event.uk_event_tx_idx_type duplicate’i engeller; uygulama duplicate’leri yutar.
+
+Reorg
+
+StacksBlock.markAsDeleted() çağrısında ilgili StacksTransaction ve TransactionEvent’lerin tamamı deleted=true olur; sorgularda deleted=false filtreli repository metotları doğru sonuç döner.
+
+Eşleşme senaryoları
+
+STX transfer ≥ eşik; FT/NFT transferler farklı sınıflarda; adres-based kurallar case-insensitive çalışır.
+
+Sıra ve bütünlük
+
+addEvent ile eventIndex doğru atar; manual index bozulmasına izin verilmez (unique kısıt).
+
+Performans
+
+Görece büyük tx/event setlerinde sender/recipient/contract/function aramaları indeks kullandığı için lineer taramaya düşmez.
+
+kısa özet (P0 → P1 → P2)
+
+P0 (hemen):
+
+StacksTransaction: txId unique, soft-delete alanları, addEvent helper.
+
+TransactionEvent: eventIndex zorunlu, unique (tx_id, event_index, event_type), soft-delete + audit.
+
+STX eventlerde BigInteger amountRaw; adres alanları ve indeksler.
+
+P1:
+
+StacksTransaction: nonce, feeRaw, acceptedAt/receivedAt, rawTx/rawResult.
+
+SmartContractEvent: index (contract+topic), valueDecoded JsonNode.
+
+ContractCall: @MapsId 1–1, (contract_identifier,function_name) index.
+
+P2:
+
+(Önceki turlar ile birlikte) aday-indeksli eşleştirme snapshot’ları, JSONPath koşul değerlendirme, gelişmiş raporlama projeksiyonları.
+
+hazırım: istersen bu P0 kalemlerini tek bir PR-taslağı olarak (entity alanları + Flyway DDL + küçük yardımcı metotlar) hazırlayıp, ardından application katmanına geçip ProcessChainhookPayloadUseCase ve AlertMatchingService tarafındaki akışları bu yeni şemayla birebir uyumlu şekilde güncelleyeyim.
+
+
+
+--------------------------------------------
+
+
+
+
+En kritik bulgular (P0)
+1) Dispatch’in commit’ten önce yapılması (hayalet bildirim riski)
+
+Belirti: Bildirimler allNotifications listesinde toplanıp aynı transaction içinde notificationDispatcher.dispatchBatch(...) ile gönderiliyor.
+Risk: Transaction daha commit olmadan e-posta/webhook giderse, commit fail durumunda tarihsiz/izsiz (ghost) bildirim üretilir. Tersi durumda da (downstream okursa) uncommitted veriyi göremez.
+Çözüm (after-commit):
+
+@Transactional
+public ProcessingResult processPayload(ChainhookPayloadDto payload) {
+    List<AlertNotification> allNotifications = new ArrayList<>();
+
+    // ... rollback → apply → evaluate rules (AlertNotification'lar DB'ye PENDING olarak yazılsın) ...
+
+    var batch = List.copyOf(allNotifications); // immutable snapshot
+    TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+        @Override public void afterCommit() {
+            notificationDispatcher.dispatchBatch(batch); // commit sonrası
+        }
+    });
+    return result.success(true) ... ;
+}
+
+
+Alternatif (daha sağlam): Transactional Outbox: Notifications tablona PENDING yaz, ayrı bir worker (Scheduler/Queue) after-commit zaten görecek ve gönderecek. Böylece bu sınıftan dispatch’i tamamen çıkarırsın.
+
+2) Idempotency eksik (yarım blok, çift işlem, çift event)
+
+Belirti: Apply’de sadece blockHash exist? kontrolü var. Transaction/event bazında “upsert/unique” stratejisi yok.
+Risk:
+
+İlk çalıştırmada block persist edildi ama bazı tx/event’ler parse hatası aldı → ikinci çalıştırmada “block var, skip” diyorsun → yarım blok kalır.
+
+Aynı payload tekrarlanırsa duplicate tx/event/notification üretilebilir.
+
+Çözüm (tablo + akış):
+
+Unique: stacks_block(block_hash), stacks_transaction(tx_id), transaction_event(transaction_id, event_index, event_type), alert_notification(rule_id, tx_id, event_id, channel).
+
+Upsert: apply’de txId exist? yoksa ekle; varsa merge (eksik eventleri tamamla). Eventlerde (tx,event_index,event_type) ile idem.
+
+Duplicate insert’ler için DataIntegrityViolationException yakala → yut/merge.
+
+Örnek (özet):
+
+if (txRepo.existsByTxId(txHash)) {
+   mergeMissingEvents(txHash, parsedEvents); // eksikleri tamamla, fazlalara dokunma
+} else {
+   txRepo.save(tx); // cascade events
+}
+
+3) Rollback (reorg) “soft delete” zinciri eksik
+
+Belirti: Rollback’te StacksBlock.markAsDeleted() çağrılıyor ama transaction/event düzeyinde her yerde aynı deleted işaretinin garanti edildiği net değil; ayrıca ilişkili AlertNotification’lar invalid edilmiyor.
+Risk: Okuma sorgularında kirli veri; daha önce tetiklenen bildirimler gerçek olmayan bir reality’yi temsil eder.
+Çözüm:
+
+Block→Tx→Event hiyerarşisinin tamamında deleted=true, deletedAt=now işaretlensin (entity’de zincirleme metot).
+
+AlertNotificationRepository.invalidateByBlockId(blockId) gibi toplu invalidasyon ekle (örn. is_invalidated=true).
+
+Tüm repository’lerde deleted=false filtresi (ya @Where ya da sorgu koşulu) zorunlu.
+
+4) Bellek ve transaction boyutu (büyük payload’larda spike)
+
+Belirti: Tüm payload tek transaction; tüm AlertNotification’lar RAM’de tutuluyor.
+Risk: Büyük apply batch’lerinde yüksek heap ve uzun transaction süresi → deadlock/timeout riski.
+Çözüm:
+
+Block başına ya da N blok/tx başına chunk’lı işlem → entityManager.flush(); entityManager.clear();.
+
+spring.jpa.properties.hibernate.jdbc.batch_size=200 + order_inserts=true.
+
+Notification listesi büyümesin: outbox’a yaz, RAM’de taşıma.
+
+5) Concurrency ve yarış koşulları
+
+Belirti: Aynı block için eşzamanlı processPayload çağrıları düşünülmemiş.
+Risk: Çift parse/çift save denemesi; unique kısıt yoksa duplicate. Varsa da constraint exception yağmuru.
+Çözüm:
+
+Unique kısıtlarla güvence + duplicate yakala/yut.
+
+(Ops.) Dağıtık kilit (Redis/DB-based lock) ile blockHash bazlı kilit.
+
+“İşlendi” işareti (processed flag) veya “ingest log” tablosu ile gözlemlenebilirlik.
+
+Önemli iyileştirmeler (P1)
+6) İşlemsel sınır ve hata semantiği
+
+Belirti: processPayload tek @Transactional; içeride parse hatası yakalanıp loop devam ediyor ama bir yerde NPE/constraint fail tüm payload’ı roll back eder.
+Öneri:
+
+Blok-bazlı işleme (her block REQUIRES_NEW): bir bloktaki hata diğerlerini düşürmesin.
+
+Ya da tek transaction içinde her 100–200 tx flush/clear.
+
+Hata özetini ProcessingResult’a liste olarak yaz (hangi tx/why).
+
+7) AlertMatching “full scan” yerine aday indeksi
+
+Belirti: getActiveRulesByType → tüm kurallar taranıyor; doğru ama O(n).
+Öneri:
+
+Matching katmanında ön-indeks:
+
+contractIdentifier→contract_call kuralları
+
+(contractIdentifier, topic)→print kuralları
+
+assetIdentifier / assetKind → token kuralları
+
+sender/recipient → address activity
+
+Bu sınıfta sadece tx→event context üret; matching zaten hızlı aday çekip değerlendirir.
+
+8) After-commit bildirim için Domain Event / Outbox
+
+Öneri:
+
+ApplicationEventPublisher ile BlockPersistedEvent/TransactionsMatchedEvent yayınla; dinleyen @TransactionalEventListener(phase=AFTER_COMMIT) olsun.
+
+Ya da outbox: alert_notification (PENDING) yazılır, ayrı dispatcher periyodik çeker.
+
+9) Ölçümleme ve izlenebilirlik (Micrometer)
+
+Öneri metrikler:
+
+chainhook.payload.blocks.apply.count, .rollback.count
+
+chainhook.block.persist.ms (timer)
+
+chainhook.tx.per.block (distribution summary)
+
+alerts.matched.count, alerts.dispatched.count
+
+parse.error.count (tx/event düzeyi)
+
+idempotent.duplicates.skipped.count
+
+10) Log kalitesi
+
+Öneri:
+
+Tüm log’larda structured context: blockHash, height, txId, eventIndex.
+
+Rollback kararlarında INFO değil WARN/NOTICE seviyelerini net ayır.
+
+Güzel olur (P2)
+
+Backpressure: Çok büyük apply yüklerinde internal queue/kuyruklama ile dispatcher’ı boğma.
+
+Retry stratejisi: Notification tarafında (PENDING→RETRYING→DEAD_LETTER).
+
+Sürümleme: Chainhook payload şemasında sürüm değişikliği için feature flag/compat layer.
+
+İşlem öncesi hafif doğrulama: blockHeight monotonic kontrol (opsiyonel; reorg’da dikkatli).
+
+Somut kod önerileri (patch fikirleri)
+A) After-commit dispatch (hemen)
+@Transactional
+public ProcessingResult processPayload(ChainhookPayloadDto payload) {
+    var result = new ProcessingResult();
+    var collected = new ArrayList<AlertNotification>();
+
+    try {
+        if (notEmpty(payload.getRollback())) {
+            result.rollbackCount = handleRollbacks(payload.getRollback()); // içinde tx/event/notification invalidate
+        }
+        if (notEmpty(payload.getApply())) {
+            // büyük payloadlarda alt metoda taşı: handleAppliesChunked(...)
+            ApplyOutcome outcome = handleApplies(payload.getApply());
+            result.applyCount = outcome.blocks;
+            collected.addAll(outcome.notifications); // sadece ID’ler de tutulabilir
+        }
+
+        // **AFTER COMMIT** dispatch
+        var snapshot = List.copyOf(collected);
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override public void afterCommit() { notificationDispatcher.dispatchBatch(snapshot); }
+        });
+
+        result.success = true;
+        return result;
+    } catch (Exception e) {
+        log.error("processPayload failed", e);
+        result.success = false; result.errorMessage = e.getMessage();
+        throw e;
+    }
+}
+
+B) Apply’de idempotency + chunk + flush/clear
+private ApplyOutcome handleApplies(List<BlockEventDto> applies) {
+    int applied = 0;
+    List<AlertNotification> notifications = new ArrayList<>();
+
+    for (var blockEvent : applies) {
+        String blockHash = blockEvent.getBlockIdentifier().getHash();
+
+        // **fast path**: block known?
+        var existing = blockRepo.findByBlockHash(blockHash);
+        if (existing.isPresent()) {
+            var b = existing.get();
+            if (b.getDeleted()) { restoreBlockGraph(b); }
+            else { log.debug("Block {} exists, skip persist", blockHash); }
+            continue;
+        }
+
+        // parse → persist
+        StacksBlock block = parser.parseBlock(blockEvent);
+
+        // tx’leri güvenli ekle
+        if (blockEvent.getTransactions()!=null) {
+            for (var txDto : blockEvent.getTransactions()) {
+                try {
+                    var tx = parser.parseTransaction(txDto, block);
+                    // idempotent upsert
+                    if (txRepo.existsByTxId(tx.getTxId())) {
+                        mergeMissingEvents(tx); // doldur, eklemeden devam
+                    } else {
+                        block.addTransaction(tx); // cascade events
+                    }
+                } catch (Exception ex) {
+                    log.warn("Parse tx {} failed, skipping", safeTxHash(txDto), ex);
+                }
+            }
+        }
+
+        blockRepo.save(block);
+        applied++;
+
+        // eşleştirme (sadece persist edilmiş tx’ler için)
+        for (var tx : block.getTransactions()) {
+            try {
+                var n = alertMatchingService.evaluateTransaction(tx);
+                notifications.addAll(n);
+            } catch (Exception ex) {
+                log.error("Matching tx {} failed", tx.getTxId(), ex);
+            }
+        }
+
+        // **büyük yüklerde** her N blokta bir flush/clear
+        if (applied % 5 == 0) {
+            entityManager.flush();
+            entityManager.clear();
+        }
+    }
+    return new ApplyOutcome(applied, notifications);
+}
+
+C) Rollback’te tam zincir + notification invalidate
+private int handleRollbacks(List<BlockEventDto> rollbacks) {
+    int count = 0;
+    for (var be : rollbacks) {
+        var hash = be.getBlockIdentifier().getHash();
+        var opt = blockRepo.findByBlockHashWithTxAndEvents(hash);
+        if (opt.isEmpty()) { log.warn("Rollback for non-existent block {}", hash); continue; }
+
+        var block = opt.get();
+        block.markAsDeleted(); // block→tx→event zinciri
+
+        blockRepo.save(block);
+        alertNotificationRepository.invalidateByBlockId(block.getId(), Instant.now());
+        count++;
+    }
+    return count;
+}
+
+D) Concurrency: duplicate’leri yutma
+try {
+    blockRepo.save(block);
+} catch (DataIntegrityViolationException dup) {
+    log.info("Block {} raced, treating as already persisted", blockHash);
+}
+
+
+Not: Tüm bu patch’ler, daha önce domain/repo’da önerdiğimiz unique/indeks ve repo metotları ile birlikte düşünülmeli.
+
+Observability (Micrometer) — hemen eklenebilir
+@Timed(value="chainhook.process.payload", histogram=true)
+@Transactional
+public ProcessingResult processPayload(...) { ... }
+
+Timer.Sample sample = Timer.start(meterRegistry);
+// her block persist: Timer.builder("chainhook.block.persist.ms").tag("result","ok|fail")...
+DistributionSummary.builder("chainhook.tx.per.block").record(block.getTransactions().size());
+Counter.builder("alerts.matched").increment(notifications.size());
+Counter.builder("chainhook.parse.error").tag("kind","tx|event").increment();
+
+Test planı (kritik senaryolar)
+
+Idempotent apply
+
+Aynı block payload’ını iki kez gönder → block sadece bir kez, tx’ler duplicate değil, eksik eventler merge edilir.
+
+Partial failure
+
+Bir tx parse deliberately fail → diğer tx’ler persist + match çalışır; summary doğru.
+
+Rollback → Apply (reorg restore)
+
+Aynı block rollback edilip sonra tekrar apply geldiğinde deleted=false restore; notifications invalidation → after-commit yeni bildirimler normal şekilde gider.
+
+After-commit dispatch
+
+Fail eden transaction’da hiç dispatch olmamalı; success’te commit sonrası tek batch çağrısı olmalı.
+
+Duplicate notifications engeli
+
+Aynı rule+tx+event+channel için iki kez match edilse bile unique kısıt yüzünden tek kayıt (veya repo-level upsert) kalır.
+
+Concurrency
+
+İki thread aynı block’u işler → biri persist eder, diğeri duplicate’i yutar; sonuç tutarlı.
+
+Memory & batch
+
+10k tx içeren apply payload’ında sınama: heap artışı yok (flush/clear ve outbox sayesinde).
+
+Kısa PR planı
+
+PR-1 (P0 | güvenlik & doğruluk)
+
+After-commit dispatch (TransactionSynchronization / @TransactionalEventListener)
+
+Rollback zinciri + notification invalidate
+
+Apply’de idempotent upsert/merge (tx/event)
+
+Duplicate’leri yut (DataIntegrityViolationException)
+
+Chunk’lı persist + flush/clear
+
+PR-2 (P0 | şema & repo)
+
+Unique/indeks: block_hash, tx_id, (tx,event_index,event_type), (rule,tx,event,channel)
+
+Repo metodları: findByBlockHashWithTxAndEvents, invalidateByBlockId, existsByTxId, insertIgnore/mergeMissingEvents
+
+PR-3 (P1 | performans & gözlem)
+
+Micrometer metrikleri, structured log
+
+Matching tarafında aday-indeks entegrasyonu (bu sınıfı sade bırakıyoruz)
+
+(Ops.) Outbox worker / Scheduler
+
+Son söz
+
+Bu sınıfın görevi veri doğruluğu + reorg dayanıklılığı + yan etkilerin güvenli koordinasyonu. Yukarıdaki P0’lar (after-commit dispatch, idempotent upsert, tam rollback zinciri, chunk/flush) olmadan production’da rastgele “ghost notification”, “yarım blok”, “flood” ve “heap spike” görürsün. Önerdiğim yamalar minimal ve mevcut tasarımı bozmadan uygulanabilir.
+
+Hazırsan PR-1 için tam diff’i (method gövdeleri ve gerekli küçük eklemelerle) çıkarayım; sonra PR-2’de schema & repo, ardından PR-3’te metrikler ve performans iyileştirmeleriyle bitirelim.
+
+
+
+
+
+--------------------------------------------
+
+
+
+AlertMatchingService
+
+Ne iyi
+
+İşlevsel kapsam doğru: tx bazında contract call, event ve failed tx kuralları tek noktadan değerlendiriliyor. API açık: evaluateTransaction(...) ve bellek önbelleğiyle kural çekimi. 
+
+AlertMatchingService
+
+ 
+
+AlertMatchingService
+
+Kural soğuma (cooldown) ve istisna güvenliği var. 
+
+AlertMatchingService
+
+Bildirim mesajı tek yerden üretiliyor; bakım kolay. 
+
+AlertMatchingService
+
+Açık risk/eksikler
+
+Kural indeksleme granülaritesi düşük
+Tüm ruleType için tek liste cache ediliyor; kural sayısı büyüdükçe her event için bütün liste dönülüyor. Contract/asset bazında ek anahtarlar yok. (Şu an AlertRuleRepository.findActiveByRuleType çağrılıyor.) 
+
+AlertMatchingService
+
+ 
+
+AlertRuleRepository
+
+Cooldown’ın yarış durumu
+isInCooldown() kontrolü ile markAsTriggered() arasında aynı kural aynı anda birden fazla iş parçacığı tarafından tetiklenebilir; optimistic lock var ama tetikleme fazladan üretilmiş olabilir.
+
+Bildirim durum yönetimi
+AlertNotification kayıtları doğrudan “sent/failed”e NotificationDispatcher içinde geçiyor; createNotifications tarafında “PENDING” atanıp idempotency anahtarı yok → bir tx tekrar işlendiğinde çift gönderim riski. (Dispatcher’ın retry akışı var, ama idempotent değil.) 
+
+NotificationDispatcher
+
+Event-türü genişleme noktası
+Şu an TOKEN_TRANSFER için yalnızca tek seferde tüm kurallar dönülüyor; ERC-20/721 benzeri ayrım (FT/NFT) kuralları, kontrat kimliği, asset_identifier ve miktar eşiklerine göre bucket edilmemiş.
+
+Nasıl düzeltelim (öneri ve snippet’ler)
+
+İn-memory index: Cache’i Map<AlertRuleType, Map<Key, List<Rule>>>’e yükselt.
+Key = (contractIdentifier || assetIdentifier || null, optional eventKey). Repository’de buna uygun “hazır” sorgular zaten var (örn. “for alert matching”). 
+
+AlertRuleRepository
+
+// P0: cache yapısını genişlet
+public record RuleKey(AlertRuleType type, String contract, String asset, String topic) {}
+
+@Cacheable(value = "alertRulesIndex", key = "'v1'")
+public Map<AlertRuleType, Map<RuleKey, List<AlertRule>>> buildIndex() {
+    var all = alertRuleRepository.findAllActive(); // gerekirse tip bazında
+    return all.stream().collect(groupingBy(
+      AlertRule::getRuleType,
+      mapping(r -> r, collectingAndThen(toList(), list -> list.stream()
+        .collect(groupingBy(r -> toKey(r)))))));
+}
+
+private RuleKey toKey(AlertRule r) {
+    // TokenTransferAlertRule -> assetIdentifier
+    // PrintEventAlertRule -> contractIdentifier + eventKey
+    // ContractCallAlertRule -> contractIdentifier + functionName (topic null)
+}
+
+
+evaluateEvent/evaluateContractCall içinde doğrudan ilgili anahtara in → O(1)+ küçük liste.
+
+Cooldown + idempotency (P0):
+
+AlertNotification için unique(tx_id, rule_id, event_index) benzersiz indeks → çift kayıt/çift gönderim engeli.
+
+createNotifications(...) içinde UPSERT yaklaşımı (Spring Data: save öncesi “var mı?” bak ve PENDING ise tekrar gönderme).
+
+Kritik alanlar için guard:
+
+transaction.getBlock() null ise NPE alırsın (mesajda block height okunuyor). Objects.requireNonNullElse ile güvene al ya da height bilinmiyorsa “n/a” yaz. 
+
+AlertMatchingService
+
+Kural eşleştirme predicateleri: rule.matches(context) pahalıysa ön-kontrol (contract/topic/asset eşitlikleri) servis katmanında yapılmalı; instanceof’dan sonra inline predicate ile “fail fast”.
+
+NotificationDispatcher
+
+Ne iyi
+
+Kanal çokluluğunu polimorfik çözüyor; uygun servisi dinamik seçiyor. 
+
+NotificationDispatcher
+
+@Async ve “failed retry” akışı var. 
+
+NotificationDispatcher
+
+ 
+
+NotificationDispatcher
+
+Eksikler / riskler
+
+@Async + @Transactional: Asenkron metod içinde transaction sınırı karışabilir (proxy çağrısı vs.). dispatchBatch() dispatch()’i aynı sınıf içinden çağırdığı için ikinci @Async efektif olmayabilir.
+
+Retry stratejisi sabit: Backoff yok, maksimum deneme AlertNotificationRepository.findPendingRetries ile 3’ten küçük ama gecikme/çarpan tanımlı değil. 
+
+AlertNotificationRepository
+
+Circuit-breaker yok: E-posta/SaaS webhook çalışmadığında servisleri boğabilir.
+
+Öneriler
+
+@Async yerine queue/outbox (Spring Events ya da Kafka/Rabbit) – minimumda @Async kalsın ama resilience4j ile retry(backoff)+circuitBreaker+timeLimiter.
+
+dispatchBatch içinde paralel akış gerekiyorsa CompletableFuture.allOf(...) ile topla; yoksa batch’te ardışık kalsın.
+
+WebhookNotificationService
+
+Ne iyi
+
+RestTemplate ile basit POST ve durum kodu kontrolü var; payload standardize edilmiş. 
+
+WebhookNotificationService
+
+ 
+
+WebhookNotificationService
+
+Eksikler / riskler
+
+Timeout, retry, circuit-breaker yok → thread’ler bloklanabilir.
+
+İmza yok: Webhook çağrıları HMAC imzasız; alıcı tarafta doğrulama yapılamaz.
+
+Idempotency-Key header’ı yok: alıcı tekrarları ayırt edemez.
+
+Öneriler / snippet
+
+// P0: WebClient + timeouts + HMAC imza
+WebClient client = WebClient.builder()
+  .baseUrl(webhookUrl)
+  .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+  .filter(ExchangeFilterFunctions.statusError(..)) // non-2xx -> error
+  .build();
+
+String body = objectMapper.writeValueAsString(payload);
+String signature = hmacSha256Hex(secret, body);
+
+client.post()
+  .uri("")
+  .header("X-Idempotency-Key", notification.getId().toString())
+  .header("X-Signature", signature)
+  .bodyValue(payload)
+  .retrieve()
+  .toBodilessEntity()
+  .timeout(Duration.ofSeconds(5));
+
+
+(P1: resilience4j CB/Retry ekle)
+
+EmailNotificationService
+
+Ne iyi
+
+JavaMailSender ile basit e-posta gönderimi; “enabled” flag’i var; konu satırı severity+rule adı. 
+
+EmailNotificationService
+
+ 
+
+EmailNotificationService
+
+Eksikler / iyileştirme
+
+HTML/şablon yok; sadece SimpleMailMessage. (Alarmlarda tablolu içerik + linkler faydalı.)
+
+“email disabled” durumunda exception atmak yerine bildirimi SKIPPED durumuna çekmek daha doğru; aksi retry kuyruğunu kirletir. 
+
+EmailNotificationService
+
+Öneri
+
+MimeMessageHelper ile HTML template (Thymeleaf/Freemarker).
+
+“disabled” → notification.markAsSkipped("EMAIL_DISABLED") sonra repo’ya kaydet.
+
+NotificationService (interface)
+
+Temel imza doğru; supports(...) ile kanal ayrımı net. (Genişlemeye uygun: Slack/Discord/SMS eklenebilir.) 
+
+NotificationService
+
+AuthenticationService
+
+Ne iyi
+
+Register/login akışı, PasswordEncoder, AuthenticationManager, UserDetailsService entegrasyonu, JWT üretimi mevcut. Expiration dışarıdan geliyor. 
+
+AuthenticationService
+
+ 
+
+AuthenticationService
+
+ 
+
+AuthenticationService
+
+Eksikler / riskler
+
+Refresh token yok; sadece access token üretiliyor.
+
+JWT claim’leri sınırlı (rol + username). Aud, iss, jti/idempotency yok.
+
+Brute-force/lockout politikası yok; login’de başarısızlık sayacı tutmuyor.
+
+E-posta doğrulama/aktiflik kontrolü register sonrasında opsiyonel.
+
+HMAC/JWS anahtar rotasyonu ve blacklist (logout) stratejisi belirtilmemiş.
+
+Hata mesajları enumere edilebilir (kötü aktör bilgi toplamasın).
+
+P0/P1 Önerileri
+
+P0: Refresh token tablosu + rolling refresh; kısa TTL access (15m), uzun TTL refresh (7-30g).
+
+P0: aud, iss, iat, exp, jti ekle; JwtTokenService tarafında “keyId (kid)” ile rotasyon.
+
+P0: Login rate-limit + basit lockout (N hatada 10 dk).
+
+P1: E-posta doğrulama, parola politikası.
+
+AlertRuleService
+
+Ne iyi
+
+Kuralları DTO’dan oluşturma, cache invalidation, kullanıcı bağlama doğru. 
+
+AlertRuleService
+
+ 
+
+AlertRuleService
+
+Statü güncelleme ve silmede cache invalidation var. 
+
+AlertRuleService
+
+ 
+
+AlertRuleService
+
+Eksikler
+
+Validation eksik: Örn. TOKEN_TRANSFER için assetIdentifier zorunluluğu, CONTRACT_CALL için contractIdentifier+functionName zorunluluğu doğrulanmıyor.
+
+AddressActivity kuralında alan set’leri boş (TODO). 
+
+AlertRuleService
+
+MonitoredContract bağlama opsiyonu yok; ileride “contract-scoped” kurallar için faydalı olur.
+
+Default cooldown ve notification kanalları için mantıklı varsayılanlar atanmıyor.
+
+Öneri
+
+Bean Validation (@Valid DTO) + servis içinde semantik kontroller.
+
+MonitoredContract (varsa) ilişkilendir.
+
+cooldownMinutes null ise config default’u (örn. app.alert.cooldown-default-minutes) kullan. (Dokümantasyonda böyle bir yaklaşım not edilmişti.) 
+
+Stacks Chain Monitor Backend – …
+
+BlockQueryService
+
+Ne iyi
+
+Zengin sorgu kapsamı: id, hash, height, zaman aralığı, latest height. 
+
+BlockQueryService
+
+ 
+
+BlockQueryService
+
+Eksik/iyileştirme
+
+getBlocks(Pageable) findAll çağırıyor; soft-delete’li kayıtları filtrelemiyor. (Repo’da “active” query’si var.) 
+
+BlockQueryService
+
+ 
+
+StacksBlockRepository
+
+Sık çağrılan getLatestBlockHeight() için cache eklenebilir.
+
+Öneri
+
+public Page<StacksBlock> getBlocks(Pageable p) {
+  return blockRepository.findActiveBlocks() // P0: pageable olmayan versiyon yerine repo'da pageable query ekle
+}
+@Cacheable("latestBlockHeight")
+public Optional<Long> getLatestBlockHeight() { ... }
+
+TransactionQueryService
+
+Burada önceki değerlendirmeye ek olarak: dinamik filtreler (JPA Specification) ve yalnızca gerekli alanları dönen projection kullanırsak liste sayfaları hızlanır. (Temel metotlar temiz ve readOnly; iyi.) 
+
+TransactionQueryService
+
+MonitoringService
+
+Ne iyi
+
+Basit istatistik ve health üretimi; cache istatistik iskeleti hazır. 
+
+MonitoringService
+
+ 
+
+MonitoringService
+
+Eksikler
+
+Actuator/Micrometer entegrasyon yok: endpoint’ler ve Prometheus metrikleri için Hook.
+
+“Son işlenen blok zamanı, geride kalma (lag), queue boyutları” gibi iş metrikleri eksik.
+
+Öneri
+
+P0: Actuator + /actuator/health, /metrics, Prometheus endpoint.
+
+P1: alert_notifications_sent_total, alert_notifications_failed_total, chain_lag_blocks metrikleri.
+
+Notification repositories & sorgular
+
+Notification retry için attemptCount < 3 filtresi var; güzel. Backoff için “en eski”den başlıyor. 
+
+AlertNotificationRepository
+
+Event/Tx/Block reposu yeterli; “max block height” mevcut. 
+
+StacksBlockRepository
+
+TransactionEventRepository.findForAlertMatching gibi kritik optimizasyon sorguları var; index önerileriyle birleştirelim. 
+
+TransactionEventRepository
+
+P0 PR-Taslağı (hemen çıkarılabilecek değişiklikler)
+
+AlertMatching index ve idempotency
+
+Cache’i alertRulesIndex (v1) map’e yükselt; event/contract/asset bazlı anahtarlar.
+
+AlertNotification için benzersiz indeks: (alert_rule_id, tx_id, event_index)
+
+createNotifications → PENDING olarak kaydet, gönderim/sonuç değişimi Dispatcher’da.
+
+Webhook & Email dayanıklılık
+
+Webhook’ta WebClient + 5 sn timeout + HMAC imza + X-Idempotency-Key. (P0 kodu yukarıda)
+
+Email disabled → exception yerine SKIPPED.
+
+Security (Auth)
+
+JWT claim set: aud, iss, jti; key rotation altyapısı; access 15m, refresh 7-30g.
+
+Basit login rate-limit/lockout.
+
+Query/soft-delete
+
+BlockQueryService.getBlocks aktif blokları döndürsün.
+
+getLatestBlockHeight cache’lenir.
+
+Monitoring
+
+Spring Boot Actuator + Prometheus; temel metrikler.
+
+Bu P0 değişiklikleri, kullanıcıya görünür davranışları bozmadan performans, güvenlik ve güvenilirliği ciddi oranda artırır.
+
+P1 (sonraki sprint)
+
+Resilience4j ile webhook/email için retry(backoff) + circuitBreaker + timeLimiter.
+
+Alert kural validasyonları (asset/contract/function zorunlulukları).
+
+AddressActivity kuralının tamamlanması. (Alıcı/kısa yollar TransactionEvent’ten çıkarılmalı.)
+
+Transaction/Block/Events üzerinde BTREE index önerileri (tx_id, block_height, contract_identifier, asset_identifier, event_type).
+
+TransactionQueryService için specification-bazlı filtreleme + projection.
+
+P2
+
+Outbox/Queue: Bildirimler outbox tablosu → message broker.
+
+Çok kiracılı (multi-tenant) kullanım için “tenant_id” sütunu + filtre katmanı.
+
+Kurallar için “schedule/cooldown/threshold” zenginleştirmeleri, JSONPath-tabanlı PrintEvent data-match (şu an TODO).
+
+Gelişmiş observability: dağıtık iz (OpenTelemetry), audit log.
+
+İstersen bu P0’ı branch’e çevirecek diff’leri sınıf sınıf çıkartayım (AlertMatchingService, WebhookNotificationService, EmailNotificationService, AuthenticationService, NotificationDispatcher + DB migration için unique index). Hangi sınıftan başlayayım?
+
+
+
+
+--------------------------------------------
+
+
+
+1) ErrorResponse
+Ne iyi
+
+
+Zaman damgası, HTTP status, kısa hata, mesaj, details map’i var; sade ve anlaşılır.
+
+
+Eksikler / Risk
+
+
+RFC 7807 (Problem Details) ile standart değil → client’lar arasında tekrar adapte gerekir.
+
+
+details alanının şeması belirsiz (field error mı, domain error mu?).
+
+
+correlation-id / request-id yok (izlenebilirlik zor).
+
+
+Hata kodu (uygulama içi sabit code) yok; front-end’de güçlü karar verilemez.
+
+
+P0 Öneriler
+
+
+RFC 7807 uyumlu şema (ProblemDetails) ya da type, title, status, detail, instance, code, correlationId.
+
+
+details için alan-hata listesi kesin biçim: errors:[{field, message, code}].
+
+
+Örnek (alternatif DTO)
+@Data @Builder
+public class ApiProblem {
+  private URI type;          // e.g. urn:problem:validation-error
+  private String title;      // Validation Error
+  private int status;        // 400
+  private String detail;     // summary
+  private String instance;   // request path
+  private String code;       // APP-VAL-001
+  private String correlationId;
+  private List<FieldErrorItem> errors; // field-level
+}
+@Data
+public class FieldErrorItem { String field; String message; String code; }
+
+
+2) GlobalExceptionHandler
+Ne iyi
+
+
+@RestControllerAdvice, @ExceptionHandler’lar mevcut.
+
+
+MethodArgumentNotValidException, BadCredentialsException, UsernameNotFoundException, generic Exception yakalıyor.
+
+
+Eksikler / Risk
+
+
+Şu an partial bir içerik var ama tipik sorunlar:
+
+
+HTTP status’lar bazen yanlış eşleşir (401 vs 403).
+
+
+MethodArgumentNotValidException çıktı formatı tutarlı değilse FE’de çok iş.
+
+
+Domain/iş hataları için özel exception hiyerarşisi yoksa “500”a düşer.
+
+
+correlation-id (örn. header X-Request-Id) üretilmiyor / response’a yazılmıyor.
+
+
+JWT hataları (expired, invalid signature) ayrı işlenmiyorsa 500’a kayar.
+
+
+Message’lar kullanıcıya fazla içsel bilgi sızdırabilir.
+
+
+
+
+P0 Öneriler
+
+
+@ExceptionHandler(MethodArgumentNotValidException) → alan listesi döndür.
+
+
+@ExceptionHandler setini genişlet: ConstraintViolationException, HttpMessageNotReadableException, AccessDeniedException, JwtException (veya io.jsonwebtoken.*).
+
+
+correlation-id üret (yoksa) ve tüm response’lara header + body koy.
+
+
+401 (kimlik doğrulama) ≠ 403 (yetki); doğru ayır.
+
+
+Snippet (val hataları)
+@ExceptionHandler(MethodArgumentNotValidException.class)
+ResponseEntity<ApiProblem> handleValidation(MethodArgumentNotValidException ex, HttpServletRequest req) {
+  var errors = ex.getBindingResult().getFieldErrors().stream()
+    .map(fe -> new FieldErrorItem(fe.getField(), fe.getDefaultMessage(), "VALIDATION"))
+    .toList();
+  var problem = ApiProblem.builder()
+    .type(URI.create("urn:problem:validation-error"))
+    .title("Validation Error").status(400).detail("One or more fields are invalid")
+    .instance(req.getRequestURI()).correlationId(getOrCreateCorrelationId(req))
+    .code("APP-VAL-001").errors(errors).build();
+  return ResponseEntity.badRequest().body(problem);
+}
+
+P1
+
+
+Uygulama istisnaları için AppException(code, httpStatus, detail) taban sınıf ve tek handler.
+
+
+Hata response’unda yerelleştirme (i18n) desteği.
+
+
+
+3) AlertRuleResponse
+Ne iyi
+
+
+Domain AlertRule → DTO’ya tip-kırılımına göre map ediyor (ContractCallAlertRule, TokenTransferAlertRule gibi).
+
+
+severity, isActive, channels, createdAt/updatedAt gibi çevrimler doğru görünüyor.
+
+
+Eksikler / Risk
+
+
+Token transfer’de eventType String dönüyor. Domain’de enum → burada da enum veya ayrık assetKind/eventTypes olmalı.
+
+
+amountThreshold BigDecimal: daha önce belirttiğimiz gibi zincirde ham birim (BigInteger/uSTX) kullanılması güvenli. Response’ta hem raw hem formatted alan ver.
+
+
+PrintEvent ve AddressActivity özel alanlarının yansıması eksik olabilir (paylaştığın parçada özellikle Token/ContractCall görünüyordu).
+
+
+P0 Öneriler
+
+
+eventType → enum/union; Token/NFT/STX için ayrık sahalar veya assetKind.
+
+
+amountThresholdRaw (BigInteger) + opsiyonel amountFormatted (String).
+
+
+AddressActivity için activityTypes (enum list) dön.
+
+
+Mini DTO düzeltmesi
+public class AlertRuleResponse {
+  // ...
+  private AssetKind assetKind;        // FT/NFT/STX
+  private Set<EventType> eventTypes;  // if applies
+  private BigInteger amountThresholdRaw;
+  private String amountThresholdFormatted; // e.g. "1.000000 STX"
+  private List<AddressActivityType> activityTypes;
+}
+
+
+4) CreateAlertRuleRequest
+Ne iyi
+
+
+ruleType, severity, notificationChannels için enum’lar; @NotBlank/@NotNull var.
+
+
+Eksikler / Risk
+
+
+Tip-özel alanlar tek DTO içinde (contractIdentifier, functionName, assetIdentifier, amountThreshold, eventType) → yanlış kombinasyonlar validation’da kaçabilir.
+
+
+eventType String; enum olmalı.
+
+
+amountThreshold BigDecimal; zincir ham birim BigInteger ile şema uyuşsun.
+
+
+notificationEmails & webhookUrl için format validasyonu yok (@Email, @URL).
+
+
+notificationChannels ile ilgili zorunluluklar (EMAIL→email gerekli, WEBHOOK→url gerekli) koşullu doğrulama ile garantilenmiyor.
+
+
+cooldownMinutes alanı yok (rule base’de vardı) → default nereden geliyor?
+
+
+AddressActivity tipinde activityTypes yok.
+
+
+P0 Öneriler
+
+
+Discriminated union yaklaşımı: CreateAlertRuleRequest base + @JsonTypeInfo ile alt tip request’leri; ya da tek DTO ama Bean Validation Groups ile koşullu zorunlulukları uygula.
+
+
+eventType → enum (veya Set<EventType>).
+
+
+amountThresholdRaw (BigInteger) + (opsiyonel) amountThresholdFormatted.
+
+
+EMAIL varsa @NotBlank notificationEmails; WEBHOOK varsa @URL webhookUrl.
+
+
+cooldownMinutes (min≥0) alanını ekle.
+
+
+Örnek (gruplu doğrulama)
+public interface ContractCallGroup {}
+public interface TokenTransferGroup {}
+
+@NotNull private AlertRuleType ruleType;
+
+@NotNull private AlertSeverity severity;
+
+@NotNull @Size(min=1) private List<NotificationChannel> notificationChannels;
+
+@URL(groups=WebhookGroup.class) private String webhookUrl;
+@Email(groups=EmailGroup.class) private String notificationEmails;
+
+@NotBlank(groups=ContractCallGroup.class) private String contractIdentifier;
+@NotBlank(groups=ContractCallGroup.class) private String functionName;
+
+@NotBlank(groups=TokenTransferGroup.class) private String assetIdentifier;
+@NotNull(groups=TokenTransferGroup.class) private Set<EventType> eventTypes;
+
+@Min(0) private Integer cooldownMinutes;
+
+
+Controller’da @Validated(ContractCallGroup.class) gibi, ruleType’a göre dinamik grup seçimi yapabilirsin (veya custom validator ile koşullu doğrulama).
+
+P1
+
+
+AddressActivity için List<AddressActivityType> activityTypes & watchedAddress validasyonları.
+
+
+Idempotency-Key (header) zorunlu kıl: aynı body ile tekrarı yut.
+
+
+
+5) LoginRequest / RegisterRequest / AuthenticationResponse
+Ne iyi
+
+
+LoginRequest ve RegisterRequest’te temel @Email/@NotBlank/@Size var.
+
+
+AuthenticationResponse’ta token, email, role, expiresIn alanları açık.
+
+
+Eksikler / Risk
+
+
+RegisterRequest: parola politikası (harf/rakam/özel karakter) yok; zayıf parola riski.
+
+
+Login brute-force koruması API katmanında görünmüyor (rate-limit/lockout).
+
+
+AuthenticationResponse.expiresIn milliseconds yorumlanmış; client’lar genelde seconds bekler → uyumsuzluk.
+
+
+Refresh token endpoint & response yok; sadece access token üretimi görünüyor.
+
+
+P0 Öneriler
+
+
+RegisterRequest.password için custom validator (min length + çeşitlilik).
+
+
+Yanıtlarda expiresIn → saniye (int/long) veya ISO-8601 expiresAt (Instant).
+
+
+AuthenticationResponse’a tokenType="Bearer", refreshToken, expiresAt ekle.
+
+
+P1
+
+
+X-RateLimit-Limit, X-RateLimit-Remaining, Retry-After başlıklarını 401/429 cevaplarında set et (security/rate-limit filtresiyle).
+
+
+
+6) Genel API Tasarım Geliştirmeleri
+Standartlar & Dokümantasyon (P0/P1)
+
+
+OpenAPI (springdoc-openapi): tüm endpoint’ler için schema, örnekler, hata cevapları (RFC7807).
+
+
+Versioning: URL (/api/v1/...) veya Accept: application/vnd.stacks-monitoring.v1+json.
+
+
+Consistent Dates: tüm tarih alanları UTC ISO-8601 (Instant).
+
+
+Pagination: page, size, sort + response’ta totalElements, totalPages, links.
+
+
+Sorting whitelists: güvenlik için sadece izinli alanlar.
+
+
+Güvenlik (P0)
+
+
+Idempotency-Key (POST/PUT) destekle → server tarafında 24 saat saklayıp duplicate’i 409/200 ile yanıtla.
+
+
+HMAC imzalı webhook (giden) & HMAC’li chainhook (gelen) zaten var; API girişleri için de replay ve timestamp kontrolü (kritik endpoint’lerde).
+
+
+Field-level allowlist: response DTO’ları kesinlikle entity sızdırmasın (şu an DTO’lar iyi gidiyor).
+
+
+Gözlemlenebilirlik (P1)
+
+
+Her response’a X-Request-Id/X-Correlation-Id.
+
+
+Actuator + Prometheus: http_server_requests_seconds + özel metrikler.
+
+
+
+Küçük “hemen uygulanabilir” patch’ler (P0)
+GlobalExceptionHandler – validation response
+@ExceptionHandler(MethodArgumentNotValidException.class)
+public ResponseEntity<ApiProblem> handleValidation(MethodArgumentNotValidException ex, HttpServletRequest req) {
+  var errors = ex.getBindingResult().getFieldErrors().stream()
+      .map(this::toItem).toList();
+  var problem = ApiProblem.builder()
+      .type(URI.create("urn:problem:validation-error"))
+      .title("Validation Error")
+      .status(HttpStatus.BAD_REQUEST.value())
+      .detail("One or more fields are invalid")
+      .instance(req.getRequestURI())
+      .correlationId(correlationId(req))
+      .code("APP-VAL-001")
+      .errors(errors)
+      .build();
+  return ResponseEntity.badRequest().body(problem);
+}
+private FieldErrorItem toItem(FieldError fe){
+  return new FieldErrorItem(fe.getField(), fe.getDefaultMessage(), fe.getCode());
+}
+
+CreateAlertRuleRequest – tip güvenliği
+// eventType: String -> enum (veya set)
+private Set<EventType> eventTypes;
+// miktar: raw
+@PositiveOrZero
+private BigInteger amountThresholdRaw;
+// koşullu doğrulama örneği:
+@AssertTrue(message = "webhookUrl is required when channel WEBHOOK is selected")
+public boolean isWebhookValid() {
+  return notificationChannels==null || !notificationChannels.contains(NotificationChannel.WEBHOOK)
+         || (webhookUrl!=null && !webhookUrl.isBlank());
+}
+
+AuthenticationResponse – daha net sözleşme
+@Data @Builder
+public class AuthenticationResponse {
+  private String tokenType;   // "Bearer"
+  private String accessToken;
+  private String refreshToken;
+  private long expiresIn;     // seconds
+  private Instant expiresAt;  // ISO-8601
+  private String email;
+  private String fullName;
+  private String role;
+}
+
+
+P0 / P1 / P2 Yol Haritası (API)
+P0 (hemen)
+
+
+Hata modeli: RFC7807 uyumlu ApiProblem + GlobalExceptionHandler güncellemesi.
+
+
+CreateAlertRuleRequest: eventTypes enum, amountThresholdRaw (BigInteger), koşullu validasyonlar; cooldownMinutes ekle.
+
+
+AuthenticationResponse: tokenType + expiresIn (seconds) + refreshToken alanları.
+
+
+Correlation-Id: tüm cevaplarda header/body.
+
+
+Unauthorized/Forbidden ayrımı: 401 vs 403 net.
+
+
+P1
+6) OpenAPI (springdoc) + örnekler + hata şeması.
+7) Idempotency-Key desteği (POST/PUT) – storage + 24h TTL.
+8) Rate-limit başlıkları (429/401).
+9) AddressActivity ve PrintEvent için request/response DTO’larında eksik alanları tamamla (activityTypes, dataConditions/JSONPath).
+P2
+10) API Versiyonlama (/api/v1).
+11) Problem types catalog (urn:problem:...) + global error code tablosu.
+12) Response Envelope (opsiyonel): { data, meta, links, error } standardizasyonu.
+
+Hazırım: İstersen önce P0’ı PR-taslağına çeviriyorum (ExceptionHandler, Error DTO, CreateAlertRuleRequest & AuthenticationResponse düzeltmeleri + ufak testler). Sonra API dokümantasyonunu (OpenAPI) ekleyip idempotency/rate-limit başlıklarına geçeriz.ChatGPT:1m 15s boyunca düşündümharika—DTO (webhook) setini ve parser’la entegrasyonunu tek tek inceledim. Aşagıda güçlü yönler, kritik uyumsuzluklar (P0), diğer eksikler (P1/P2) ve hemen uygulanabilir patch/snippet’lar var. Yorumlarım somut kod satırları ve class tanımlarıyla referanslı.
+
+Genel güçlü yönler
+
+
+Tüm DTO’larda @JsonIgnoreProperties(ignoreUnknown = true) var → ileri uyumluluk için doğru tercih; Chainhook şemasına alan eklense de sistem kırılmaz. ChainhookPayloadDto BlockEventDto EventDto
+
+
+Üst DTO yapısı apply/rollback bloklarını ayrı listeler halinde taşıyor → akış net. ChainhookPayloadDto
+
+
+ExecutionCostDto gibi “maliyet” alanları ayrı DTO ile modellenmiş → ayrık sorumluluk. ExecutionCostDto
+
+
+PositionDto.index ile event/tx sırası korunuyor → idempotent işlemlemeye yardımcı. PositionDto
+
+
+
+En kritik uyumsuzluklar (P0)
+1) BlockMetadataDto ↔ Parser alan uyuşmazlığı
+
+
+Parser metadata.getBurnBlockHeight() / getBurnBlockHash() / getBurnBlockTime() / getMiner() alanlarını bekliyor ve block’a yazıyor. ChainhookPayloadParser
+
+
+BlockMetadataDto ise şu alanları içeriyor: bitcoin_anchor_block_identifier, pox_cycle_*, confirm_microblock_identifier, stacks_block_hash — burn_* ve miner alanları yok. BlockMetadataDto
+
+
+
+Sonuç: Bu hâliyle parser, null dönecek alanlara erişmeye çalışır ve NPE/eksik veri tehlikesi doğar. P0 olarak DTO ile parser aynı şemaya çekilmeli.
+
+Çözüm (2 seçenek)
+A) DTO’yu parser’a uydur: BlockMetadataDto’ya aşağıdakileri ekle (Chainhook’ın gerçek alan adları snake_case ise @JsonProperty ile eşleştir):
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class BlockMetadataDto {
+  @JsonProperty("bitcoin_anchor_block_identifier")
+  private BlockIdentifierDto bitcoinAnchorBlockIdentifier;
+
+  @JsonProperty("pox_cycle_index")     private Integer poxCycleIndex;
+  @JsonProperty("pox_cycle_position")  private Integer poxCyclePosition;
+  @JsonProperty("pox_cycle_length")    private Integer poxCycleLength;
+
+  @JsonProperty("confirm_microblock_identifier")
+  private BlockIdentifierDto confirmMicroblockIdentifier;
+
+  @JsonProperty("stacks_block_hash")   private String stacksBlockHash;
+
+  // === Parser'ın bekledikleri ===
+  @JsonProperty("burn_block_height")   private Long  burnBlockHeight;
+  @JsonProperty("burn_block_hash")     private String burnBlockHash;
+  @JsonProperty("burn_block_time")     private Long  burnBlockTime; // epoch seconds
+  @JsonProperty("miner")               private String miner;
+}
+
+B) Parser’ı DTO’ya uydur: Parser’daki burn/miner atamalarını opsiyonel yap ve alan adlarını BlockMetadataDto’da var olanlara göre değiştir.
+
+Ben A’yı öneriyorum; Chainhook tarafında burn block ve miner bilgisi tipik olarak bulunur; dashboard/metrikler için faydalı.
+
+
+2) Index Block Hash yanlış eşleme riski
+Parser, indexBlockHash’i block hash ile aynı set ediyor:
+block.setIndexBlockHash(identifier.getHash()); ChainhookPayloadParser
+Oysa Stacks’te index_block_hash ve block_hash farklı konseptler olabilir. Bu alan gerçekten Chainhook payload’ında farklı bir property ise (index_block_hash vb.), doğru alan üzerinden doldurun; yoksa bu sütunu kaldırın.
+
+3) Transaction fee/amount birimleri
+
+
+Parser, metadata.getFee() değerini BigDecimal.valueOf(...) ile feeRate’e basıyor. Fee’nin birimi (microSTX? STX?) net değil. ChainhookPayloadParser
+
+
+Event tarafında miktarlar (amount) BigDecimal’a çevriliyor; upstream JSON bazen string olarak gelebilir. ChainhookPayloadParser
+
+
+
+Öneri (P0): Ham birim için BigInteger amountRaw/feeRaw alanları kullanın; formatlı gösterim için ayrı field (örn. amountFormatted). Dönüşüm ölçekleri (decimals) sözleşmeden/asset metadatasından alınmalı.
+
+
+4) Nonce varsayılanı 0
+Parser nonce’ı her zaman 0 set ediyor (metadata’da varsa bile alınmıyor). ChainhookPayloadParser
+P0: TransactionMetadataDto içinde nonce varsa okuyun; yoksa null bırakın (veya opsiyonel).
+
+5) operations alanı List<Object>
+TransactionDto.operations tipi belirsiz (List<Object>); parser da kullanmıyor. TransactionDto
+P0: Ya @JsonIgnore ile kaldırın, ya da tip güvenli alt DTO tanımlayın. Boş/jenkins uyarılarını da azaltır.
+
+Diğer önemli noktalar (P1/P2)
+6) Event tipi “stringly-typed”
+EventDto.type String; parser’da manuel map ve alias handling var (örn. FT_TRANSFER_EVENT ↔ FT_TRANSFER). EventDto ChainhookPayloadParser
+P1: DTO seviyesinde enum’a zorlamayın (upstream şema değişken), ama parser’da yaptığınız alias switch iyi. Ek olarak bir normalizer util’i ile tek merkezden yönetin.
+7) ChainhookMetadataDto.predicate tipi
+Şu an Object. ChainhookMetadataDto
+P1: JsonNode (Jackson) kullanın → JSON yapısını kayıpsız saklayın, gerektiğinde schema validate edin.
+8) Position / Event index
+PositionDto.index var ama transaction index fallback’i parser’da 0 set ediliyor. PositionDto ChainhookPayloadParser
+P1: null ise 0 yerine nullable bırakmak, duplicate tespitinde daha güvenli; zorunluysa controller seviyesinde reject edin.
+9) Büyük payload’lar (Bellek ve gecikme)
+PDF’teki önerilerle uyumlu olarak: Jackson Streaming (incremental parse) ve async kuyruğa atma ile endpoint’i hızlı döndürün. Stacks Blockchain Smart Contrac…
+DTO’lar kalsın; controller katmanında streaming parser → DTO → domain’e “chunked/batched” çeviri yapılabilir.
+
+Sınıf sınıf mini check-list + düzeltmeler
+ChainhookPayloadDto
+
+
+✔ apply / rollback listeleri. ChainhookPayloadDto
+
+
+Öneri: apply/rollback boşsa null yerine boş liste normalize edin (controller’da). Idempotency logikleri için faydalı.
+
+
+BlockEventDto
+
+
+✔ block_identifier, parent_block_identifier, timestamp, transactions, metadata. BlockEventDto
+
+
+Öneri: timestamp epoch seconds → parser zaten Instant.ofEpochSecond ile çeviriyor, doğru. ChainhookPayloadParser
+
+
+BlockMetadataDto
+
+
+❌ Parser’ın beklediği burn_* ve miner alanları eksik. (P0 düzelt) ChainhookPayloadParser BlockMetadataDto
+
+
+TransactionDto (+ Meta/Kind/Receipt altları)
+
+
+✔ transaction_identifier.hash kullanılıyor. ChainhookPayloadParser
+
+
+⚠ operations kullanılmıyor; tip belirsiz. (P0 kaldır/ignore) TransactionDto
+
+
+⚠ metadata.nonce okunmuyor. (P0 ekle) ChainhookPayloadParser
+
+
+✔ receipt.events parser’da dönülüyor. ChainhookPayloadParser
+
+
+EventDto
+
+
+✔ type + data (Map). EventDto
+
+
+Öneri: data içinden kesin anahtarlar için küçük helper’lar (zaten parser’da var). Alias seti genişleyebilir; util ile merkezileştirin. ChainhookPayloadParser
+
+
+ExecutionCostDto
+
+
+✔ read/write counts/length + runtime alanları net. ExecutionCostDto
+
+
+Öneri: Ölçüm birimini (instructions/bytes/ms) dokümante edin; metrik isimleriyle hizalayın.
+
+
+ChainhookMetadataDto
+
+
+⚠ predicate: Object → JsonNode önerisi. ChainhookMetadataDto
+
+
+PositionDto
+
+
+✔ index integer. (Event sırası için yeterli). PositionDto
+
+
+
+Parser’a yönelik ek düzeltmeler (DTO ile birlikte düşünün)
+
+
+Null-safe mapping & default
+
+
+
+
+nonce, fee, sender, sponsor vb. null olabilir → domain’de opsiyonel; default atamak yerine nullable bırakın. (Şu an nonce=0 yapılıyor) ChainhookPayloadParser
+
+
+
+
+Birimler
+
+
+
+
+feeRate/amount için ham (BigInteger) + formatlı (String) iki katman.
+
+
+
+
+Index block hash
+
+
+
+
+Gerçek alan farklıysa düzeltin; değilse sütunu kaldırın. ChainhookPayloadParser
+
+
+
+
+Event normalizasyon
+
+
+
+
+Alias listesi parser’da var; bunu küçük bir EventTypeNormalizer class’ına taşıyın.
+
+
+
+Hızlı PR taslağı (P0)
+
+
+BlockMetadataDto alanları ekle (burn_* + miner). (Yukarıdaki snippet) BlockMetadataDto ChainhookPayloadParser
+
+
+TransactionDto.operations → @JsonIgnore veya tipli alt DTO. TransactionDto
+
+
+Parser: nonce → metadata’dan al; yoksa null. ChainhookPayloadParser
+
+
+Parser: fee/amount → ham BigInteger alanları tanımla, dönüştürücüyü ortak util’e taşı. ChainhookPayloadParser
+
+
+IndexBlockHash eşlemesini gerçek payload alanına göre düzelt veya alanı kaldır. ChainhookPayloadParser
+
+
+ChainhookMetadataDto.predicate → JsonNode. ChainhookMetadataDto
+
+
+
+Bu altı kalem, Chainhook akışının kırılma riskini ortadan kaldırır ve veri tutarlılığını yükseltir.
+
+
+Test stratejisi (öneri)
+
+
+JSON örnekleri:
+
+
+Sadece apply, sadece rollback, her ikisi dolu. ChainhookPayloadDto
+
+
+BlockMetadataDto içinde burn_ alanları dolu/boş* varyasyonları. BlockMetadataDto
+
+
+TransactionMetadataDto’da nonce, fee, receipt.events farklı kombinasyonları. ChainhookPayloadParser
+
+
+Event alias’ları: FT_TRANSFER_EVENT ve FT_TRANSFER gibi tüm varyantlar. ChainhookPayloadParser
+
+
+
+
+Parser unit/integration:
+
+
+parseBlock → epoch → Instant dönüşümü; miner/burn alanları. ChainhookPayloadParser
+
+
+parseTransaction → txId, sender, sponsor, success, nonce, fee, events. ChainhookPayloadParser
+
+
+Idempotency: Aynı block hash ile iki kez gönderimde ikinci turda “skip/restore” davranışı. ProcessChainhookPayloadUseCase
+
+
+
+
+
+Sonuç
+
+
+DTO setinin iskeleti doğru; fakat BlockMetadataDto ↔ Parser alan uyumsuzluğu P0 seviyesinde mutlaka düzeltilmeli. (burn_* ve miner) ChainhookPayloadParser BlockMetadataDto
+
+
+operations’ın tip güvenliği ve nonce/fee birimlerinin netleştirilmesi, ileride veri bütünlüğü ve analitik doğruluk için şart. TransactionDto ChainhookPayloadParser
+
+
+Event alias normalizasyonu ve predicate’in JsonNode’a alınması, uzun vadede bakım kolaylığı sağlar. ChainhookPayloadParser ChainhookMetadataDto
+
+
+İstersen bu P0’lık değişiklikleri PR-taslağına çevirip class-class diff hazırlayayım; ardından P1’lere (ham/formatlı birimler, normalizer, streaming parse) geçeriz.
