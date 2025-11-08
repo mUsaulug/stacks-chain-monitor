@@ -38,7 +38,8 @@ import java.time.Instant;
 public abstract class TransactionEvent {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "transaction_event_seq_gen")
+    @SequenceGenerator(name = "transaction_event_seq_gen", sequenceName = "transaction_event_seq", allocationSize = 50)
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)

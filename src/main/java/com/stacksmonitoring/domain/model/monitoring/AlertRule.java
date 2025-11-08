@@ -41,7 +41,8 @@ import java.util.List;
 public abstract class AlertRule {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "alert_rule_seq_gen")
+    @SequenceGenerator(name = "alert_rule_seq_gen", sequenceName = "alert_rule_seq", allocationSize = 50)
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)

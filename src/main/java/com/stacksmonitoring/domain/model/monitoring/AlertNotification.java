@@ -44,7 +44,8 @@ import java.time.Instant;
 public class AlertNotification {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "alert_notification_seq_gen")
+    @SequenceGenerator(name = "alert_notification_seq_gen", sequenceName = "alert_notification_seq", allocationSize = 50)
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)

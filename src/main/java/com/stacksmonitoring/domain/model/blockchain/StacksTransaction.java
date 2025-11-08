@@ -34,7 +34,8 @@ import java.util.List;
 public class StacksTransaction {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "stacks_transaction_seq_gen")
+    @SequenceGenerator(name = "stacks_transaction_seq_gen", sequenceName = "stacks_transaction_seq", allocationSize = 50)
     private Long id;
 
     @Column(name = "tx_id", nullable = false, unique = true, length = 66)

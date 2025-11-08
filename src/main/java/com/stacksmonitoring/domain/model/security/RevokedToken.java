@@ -43,7 +43,8 @@ import java.time.Instant;
 public class RevokedToken {
 
     @Id
-    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "revoked_token_seq_gen")
+    @SequenceGenerator(name = "revoked_token_seq_gen", sequenceName = "revoked_token_seq", allocationSize = 50)
     private Long id;
 
     /**
