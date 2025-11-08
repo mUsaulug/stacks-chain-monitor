@@ -118,6 +118,10 @@ stacks:
     webhook:
       hmac-secret: ${CHAINHOOK_HMAC_SECRET:change-me-in-production}
       enabled: true
+      # Replay attack protection (timestamp validation)
+      # Requires client to include X-Signature-Timestamp header
+      # HMAC calculated as: hmac(secret, timestamp + "." + body)
+      replay-protection: ${CHAINHOOK_REPLAY_PROTECTION:true}
 
     # Alert engine configuration
     alert:
