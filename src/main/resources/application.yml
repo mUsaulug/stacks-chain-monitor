@@ -138,9 +138,22 @@ stacks:
 # Security configuration
 security:
   jwt:
-    secret-key: ${JWT_SECRET_KEY:change-me-in-production-use-256-bit-key}
-    expiration-ms: 86400000 # 24 hours
+    # RS256 asymmetric key configuration
+    # IMPORTANT: Never commit private keys to git
+    # In production, use environment variables or secret management service
+    private-key-path: ${JWT_PRIVATE_KEY_PATH:classpath:keys/jwt-private-key.pem}
+    public-key-path: ${JWT_PUBLIC_KEY_PATH:classpath:keys/jwt-public-key.pem}
+
+    # Token expiration and issuer
+    expiration-ms: 900000 # 15 minutes (recommended: short-lived access tokens)
+    refresh-token-expiration-ms: 604800000 # 7 days
     issuer: stacks-chain-monitor
+
+    # Key ID for key rotation support
+    key-id: ${JWT_KEY_ID:key-2025-11}
+
+    # Clock skew tolerance (in seconds)
+    clock-skew-seconds: 60
 
   rate-limit:
     enabled: true
