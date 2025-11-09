@@ -1,11 +1,13 @@
 package com.stacksmonitoring.infrastructure.config;
 
+import com.stacksmonitoring.application.service.WebhookArchivalService;
+import com.stacksmonitoring.domain.model.webhook.RawWebhookEvent;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.lang.NonNull;
 import org.springframework.stereotype.Component;
@@ -25,6 +27,11 @@ import java.util.HexFormat;
  * HMAC-SHA256 validation filter for Chainhook webhook endpoints.
  * Validates signature in X-Signature header to ensure webhook authenticity.
  *
+ * Event Sourcing Integration (A.2):
+ * - Archives ALL webhooks BEFORE validation (PENDING status)
+ * - Updates status to REJECTED if HMAC validation fails
+ * - Controller updates status to PROCESSED/FAILED after processing
+ *
  * Security Enhancements (OWASP Best Practices):
  * - Timestamp validation: Reject requests older than 5 minutes
  * - HMAC includes timestamp: hmac(secret, timestamp + "." + body)
@@ -36,17 +43,17 @@ import java.util.HexFormat;
  * 3. HMAC calculated as: hmac(secret, timestamp + "." + body)
  * 4. Future enhancement: Nonce tracking with Redis (P0-2)
  *
- * Reference: CLAUDE.md P0-4 (HMAC Replay Protection)
+ * Reference: CLAUDE.md P0-4 (HMAC Replay Protection), A.2 (Webhook Archival)
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class ChainhookHmacFilter extends OncePerRequestFilter {
 
     private static final String HMAC_ALGORITHM = "HmacSHA256";
     private static final String SIGNATURE_HEADER = "X-Signature";
     private static final String TIMESTAMP_HEADER = "X-Signature-Timestamp";
     private static final long MAX_TIMESTAMP_SKEW_SECONDS = 300; // 5 minutes
+    private static final String WEBHOOK_ID_ATTRIBUTE = "webhookEventId";
 
     @Value("${stacks.monitoring.webhook.hmac-secret}")
     private String hmacSecret;
@@ -56,6 +63,9 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
 
     @Value("${stacks.monitoring.webhook.replay-protection:true}")
     private boolean replayProtectionEnabled;
+
+    @Autowired(required = false)
+    private WebhookArchivalService webhookArchivalService;
 
     @Override
     protected void doFilterInternal(
@@ -78,11 +88,36 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
         // Wrap request to allow reading body multiple times
         ContentCachingRequestWrapper wrappedRequest = new ContentCachingRequestWrapper(request);
 
+        // Archive webhook BEFORE validation (Event Sourcing - A.2)
+        Long webhookEventId = null;
+        String requestBody = null;
+
         try {
+            // Read request body for archival and validation
+            byte[] requestBodyBytes = wrappedRequest.getContentAsByteArray();
+            if (requestBodyBytes.length == 0) {
+                // Body not yet cached, read it
+                requestBodyBytes = wrappedRequest.getInputStream().readAllBytes();
+            }
+            requestBody = new String(requestBodyBytes, StandardCharsets.UTF_8);
+
+            // Archive webhook with PENDING status (before any validation)
+            if (webhookArchivalService != null) {
+                RawWebhookEvent archived = webhookArchivalService.archiveIncomingWebhook(
+                    wrappedRequest, requestBody);
+                webhookEventId = archived.getId();
+
+                // Store webhook ID in request attribute for controller access
+                wrappedRequest.setAttribute(WEBHOOK_ID_ATTRIBUTE, webhookEventId);
+                log.debug("Archived webhook with ID: {} (request ID: {})",
+                    webhookEventId, archived.getRequestId());
+            }
+
             // Extract signature from header
             String providedSignature = wrappedRequest.getHeader(SIGNATURE_HEADER);
             if (providedSignature == null || providedSignature.isEmpty()) {
                 log.warn("Chainhook webhook rejected: Missing {} header", SIGNATURE_HEADER);
+                markAsRejected(webhookEventId, "Missing HMAC signature header");
                 response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Missing HMAC signature");
                 return;
             }
@@ -94,6 +129,7 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
             if (replayProtectionEnabled) {
                 if (timestampHeader == null || timestampHeader.isEmpty()) {
                     log.warn("Chainhook webhook rejected: Missing {} header", TIMESTAMP_HEADER);
+                    markAsRejected(webhookEventId, "Missing timestamp header");
                     response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Missing timestamp header");
                     return;
                 }
@@ -102,6 +138,7 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
                     timestamp = Long.parseLong(timestampHeader);
                 } catch (NumberFormatException e) {
                     log.warn("Chainhook webhook rejected: Invalid timestamp format");
+                    markAsRejected(webhookEventId, "Invalid timestamp format: " + timestampHeader);
                     response.sendError(HttpServletResponse.SC_BAD_REQUEST, "Invalid timestamp format");
                     return;
                 }
@@ -113,29 +150,25 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
                 if (timeDiff > MAX_TIMESTAMP_SKEW_SECONDS) {
                     log.warn("Chainhook webhook rejected: Stale timestamp (diff: {}s, max: {}s)",
                             timeDiff, MAX_TIMESTAMP_SKEW_SECONDS);
+                    markAsRejected(webhookEventId,
+                        String.format("Stale timestamp (diff: %ds, max: %ds)", timeDiff, MAX_TIMESTAMP_SKEW_SECONDS));
                     response.sendError(HttpServletResponse.SC_UNAUTHORIZED,
                             "Request timestamp outside acceptable window");
                     return;
                 }
             }
 
-            // Read request body
-            byte[] requestBody = wrappedRequest.getContentAsByteArray();
-            if (requestBody.length == 0) {
-                // Body not yet cached, read it
-                requestBody = wrappedRequest.getInputStream().readAllBytes();
-            }
-
             // Calculate expected signature (includes timestamp if replay protection enabled)
             String expectedSignature = replayProtectionEnabled
-                    ? calculateHmacSignatureWithTimestamp(timestamp, requestBody)
-                    : calculateHmacSignature(requestBody);
+                    ? calculateHmacSignatureWithTimestamp(timestamp, requestBody.getBytes(StandardCharsets.UTF_8))
+                    : calculateHmacSignature(requestBody.getBytes(StandardCharsets.UTF_8));
 
             // Compare signatures (constant-time comparison)
             if (!MessageDigest.isEqual(
                     providedSignature.getBytes(StandardCharsets.UTF_8),
                     expectedSignature.getBytes(StandardCharsets.UTF_8))) {
                 log.warn("Chainhook webhook rejected: Invalid HMAC signature");
+                markAsRejected(webhookEventId, "Invalid HMAC signature");
                 response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid HMAC signature");
                 return;
             }
@@ -146,7 +179,21 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
 
         } catch (Exception e) {
             log.error("HMAC validation error: {}", e.getMessage(), e);
+            markAsRejected(webhookEventId, "HMAC validation error: " + e.getMessage());
             response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, "HMAC validation failed");
+        }
+    }
+
+    /**
+     * Mark archived webhook as REJECTED (validation failed, cannot be replayed).
+     */
+    private void markAsRejected(Long webhookEventId, String errorMessage) {
+        if (webhookEventId != null && webhookArchivalService != null) {
+            try {
+                webhookArchivalService.markAsRejected(webhookEventId, errorMessage);
+            } catch (Exception e) {
+                log.error("Failed to mark webhook {} as REJECTED: {}", webhookEventId, e.getMessage());
+            }
         }
     }
 
