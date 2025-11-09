@@ -91,6 +91,33 @@ public class AlertNotification {
     private Instant createdAt;
 
     /**
+     * Invalidation tracking for blockchain reorganizations.
+     * When underlying transaction/event is soft-deleted due to rollback,
+     * this notification is marked as invalidated.
+     *
+     * IMPORTANT: This is NOT soft-delete. Notification WAS sent legitimately,
+     * but the underlying blockchain data became invalid due to reorg.
+     * We preserve the audit trail while preventing re-dispatch.
+     *
+     * Reference: V9 Migration - Blockchain Rollback Notification Invalidation [P0]
+     */
+    @Column(name = "invalidated", nullable = false)
+    private Boolean invalidated = false;
+
+    /**
+     * Timestamp when notification was invalidated (blockchain reorg detected).
+     */
+    @Column(name = "invalidated_at")
+    private Instant invalidatedAt;
+
+    /**
+     * Why notification was invalidated.
+     * Common values: BLOCKCHAIN_REORG, MANUAL
+     */
+    @Column(name = "invalidation_reason", length = 100)
+    private String invalidationReason;
+
+    /**
      * Mark notification as sent successfully.
      */
     public void markAsSent() {
@@ -119,6 +146,34 @@ public class AlertNotification {
      */
     public boolean shouldRetry() {
         return attemptCount < 3 && status == NotificationStatus.FAILED;
+    }
+
+    /**
+     * Mark notification as invalidated due to blockchain reorganization.
+     * Idempotent: If already invalidated, this is a no-op.
+     *
+     * @param reason Why notification was invalidated (BLOCKCHAIN_REORG, MANUAL, etc.)
+     */
+    public void markAsInvalidated(String reason) {
+        // Idempotent guard: Skip if already invalidated
+        if (Boolean.TRUE.equals(this.invalidated)) {
+            return; // Already invalidated, no-op
+        }
+
+        this.invalidated = true;
+        this.invalidatedAt = Instant.now();
+        this.invalidationReason = reason;
+    }
+
+    /**
+     * Check if notification is valid (not invalidated).
+     * Used by dispatcher to skip invalidated notifications.
+     *
+     * @return true if notification is valid, false if invalidated
+     */
+    public boolean isValid() {
+        // Null-safe: treat null as false (not invalidated)
+        return !Boolean.TRUE.equals(this.invalidated);
     }
 
     @Override
