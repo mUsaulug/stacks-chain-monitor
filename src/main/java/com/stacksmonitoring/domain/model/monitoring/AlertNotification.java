@@ -3,6 +3,7 @@ package com.stacksmonitoring.domain.model.monitoring;
 import com.stacksmonitoring.domain.model.blockchain.StacksTransaction;
 import com.stacksmonitoring.domain.model.blockchain.TransactionEvent;
 import com.stacksmonitoring.domain.valueobject.NotificationChannel;
+import com.stacksmonitoring.domain.valueobject.NotificationDeliveryStatus;
 import com.stacksmonitoring.domain.valueobject.NotificationStatus;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
@@ -118,11 +119,40 @@ public class AlertNotification {
     private String invalidationReason;
 
     /**
+     * Delivery status tracking for Resilience4j integration.
+     * Tracks lifecycle: PENDING → DELIVERING → DELIVERED/RETRYING/DEAD_LETTER
+     *
+     * Reference: V10 Migration - Notification Dead Letter Queue [P0]
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "delivery_status", nullable = false, length = 20)
+    private NotificationDeliveryStatus deliveryStatus = NotificationDeliveryStatus.PENDING;
+
+    /**
+     * Number of delivery attempts (incremented on each retry).
+     */
+    @Column(name = "delivery_attempt_count", nullable = false)
+    private Integer deliveryAttemptCount = 0;
+
+    /**
+     * Timestamp of last delivery attempt (used for retry scheduling).
+     */
+    @Column(name = "last_delivery_attempt_at")
+    private Instant lastDeliveryAttemptAt;
+
+    /**
+     * Last delivery error message (for debugging).
+     */
+    @Column(name = "last_delivery_error", columnDefinition = "TEXT")
+    private String lastDeliveryError;
+
+    /**
      * Mark notification as sent successfully.
      */
     public void markAsSent() {
         this.status = NotificationStatus.SENT;
         this.sentAt = Instant.now();
+        this.deliveryStatus = NotificationDeliveryStatus.DELIVERED;
     }
 
     /**
@@ -146,6 +176,41 @@ public class AlertNotification {
      */
     public boolean shouldRetry() {
         return attemptCount < 3 && status == NotificationStatus.FAILED;
+    }
+
+    /**
+     * Update delivery tracking after delivery attempt.
+     */
+    public void updateDeliveryTracking(NotificationDeliveryStatus newStatus, String error) {
+        this.deliveryStatus = newStatus;
+        this.deliveryAttemptCount++;
+        this.lastDeliveryAttemptAt = Instant.now();
+        if (error != null) {
+            this.lastDeliveryError = error;
+        }
+    }
+
+    /**
+     * Mark notification as being delivered (in progress).
+     */
+    public void markAsDelivering() {
+        this.deliveryStatus = NotificationDeliveryStatus.DELIVERING;
+    }
+
+    /**
+     * Mark notification as retrying after transient failure.
+     */
+    public void markAsRetrying(String error) {
+        updateDeliveryTracking(NotificationDeliveryStatus.RETRYING, error);
+    }
+
+    /**
+     * Mark notification as permanently failed (moved to DLQ).
+     */
+    public void markAsDeadLetter(String error) {
+        updateDeliveryTracking(NotificationDeliveryStatus.DEAD_LETTER, error);
+        this.status = NotificationStatus.FAILED;
+        this.failureReason = "Moved to dead-letter queue: " + error;
     }
 
     /**
