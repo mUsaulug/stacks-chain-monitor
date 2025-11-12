@@ -93,7 +93,7 @@ class IdempotentWebhookProcessingTest {
                     throw new RuntimeException(e);
                 }
             }))
-            .toList();
+            .collect(java.util.stream.Collectors.toList());
 
         // Release all threads simultaneously (maximize race condition)
         latch.countDown();
