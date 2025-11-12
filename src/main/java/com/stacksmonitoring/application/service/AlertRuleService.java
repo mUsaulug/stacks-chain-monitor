@@ -50,7 +50,7 @@ public class AlertRuleService {
         rule.setNotificationChannels(request.getNotificationChannels());
         rule.setNotificationEmails(request.getNotificationEmails());
         rule.setWebhookUrl(request.getWebhookUrl());
-        rule.setIsActive(true);
+        rule.setActive(true);
 
         AlertRule savedRule = alertRuleRepository.save(rule);
 
@@ -132,7 +132,7 @@ public class AlertRuleService {
     @Transactional
     public AlertRule updateRuleStatus(Long ruleId, boolean active) {
         AlertRule rule = getRule(ruleId);
-        rule.setIsActive(active);
+        rule.setActive(active);
 
         AlertRule updatedRule = alertRuleRepository.save(rule);
 
