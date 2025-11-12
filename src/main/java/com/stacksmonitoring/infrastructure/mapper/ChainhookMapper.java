@@ -114,7 +114,8 @@ public interface ChainhookMapper {
      * Map EventDto to NFTTransferEvent.
      */
     @Mapping(target = "assetIdentifier", source = "data", qualifiedByName = "extractString:asset_identifier")
-    @Mapping(target = "assetId", source = "data", qualifiedByName = "extractString:value")
+    @Mapping(target = "assetClassIdentifier", source = "data", qualifiedByName = "extractContractFromAsset")
+    @Mapping(target = "rawValue", source = "data", qualifiedByName = "extractString:value")
     @Mapping(target = "sender", source = "data", qualifiedByName = "extractString:sender")
     @Mapping(target = "recipient", source = "data", qualifiedByName = "extractString:recipient")
     @Mapping(target = "contractIdentifier", source = "data", qualifiedByName = "extractContractFromAsset")
