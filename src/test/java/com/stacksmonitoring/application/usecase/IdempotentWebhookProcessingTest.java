@@ -75,7 +75,7 @@ class IdempotentWebhookProcessingTest {
 
     @Test
     @DisplayName("10 concurrent threads processing same webhook → only 1 record")
-    void testConcurrentWebhookProcessing_OnlyOneRecord() throws InterruptedException, ExecutionException {
+    void testConcurrentWebhookProcessing_OnlyOneRecord() throws InterruptedException, ExecutionException, java.util.concurrent.TimeoutException {
         // Given - Create test webhook payload
         ChainhookPayloadDto payload = createTestPayload("0xconcurrent123", 2000L, "0xconcurrent_tx789");
 
