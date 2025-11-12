@@ -2,18 +2,18 @@
 <configuration>
     <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
 
-    <!-- Console Appender -->
+    <!-- Console Appender with MDC -->
     <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} [%X{request_id:-NO_REQ_ID}] [%thread] %-5level %logger{36} - %msg %X{user_id} %X{block_hash} %X{tx_id} %X{notification_id}%n</pattern>
         </encoder>
     </appender>
 
-    <!-- File Appender -->
+    <!-- File Appender with MDC -->
     <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
         <file>logs/stacks-monitor.log</file>
         <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n</pattern>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} [%X{request_id:-NO_REQ_ID}] [%thread] %-5level %logger{36} - %msg %X{user_id} %X{block_hash} %X{tx_id}%n</pattern>
         </encoder>
         <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
             <fileNamePattern>logs/stacks-monitor.%d{yyyy-MM-dd}.%i.log</fileNamePattern>
