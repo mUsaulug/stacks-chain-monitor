@@ -57,8 +57,7 @@ CREATE INDEX idx_webhook_payload_gin
 -- ============================================================
 
 COMMENT ON TABLE raw_webhook_events IS
-    'Event Sourcing: Archives all incoming Chainhook webhooks for debugging, auditing, and replay. ' ||
-    'Enables investigation of processing failures and webhook re-delivery detection.';
+    'Event Sourcing: Archives all incoming Chainhook webhooks for debugging, auditing, and replay. Enables investigation of processing failures and webhook re-delivery detection.';
 
 COMMENT ON COLUMN raw_webhook_events.headers_json IS
     'HTTP headers from webhook request (includes X-Signature for HMAC validation)';
@@ -67,8 +66,7 @@ COMMENT ON COLUMN raw_webhook_events.payload_json IS
     'Full JSON payload from Chainhook (blocks, transactions, events)';
 
 COMMENT ON COLUMN raw_webhook_events.processing_status IS
-    'PENDING: not yet processed, PROCESSED: successfully processed, ' ||
-    'FAILED: processing error (can retry), REJECTED: invalid signature/payload (cannot retry)';
+    'PENDING: not yet processed, PROCESSED: successfully processed, FAILED: processing error (can retry), REJECTED: invalid signature/payload (cannot retry)';
 
 COMMENT ON INDEX idx_webhook_received_at IS
     'Performance: fast queries for recent webhooks (admin dashboard)';
