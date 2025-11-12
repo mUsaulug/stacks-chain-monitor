@@ -19,10 +19,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ChainhookPayloadParserTest {
 
     private ChainhookPayloadParser parser;
+    private com.stacksmonitoring.infrastructure.mapper.ChainhookMapper chainhookMapper;
 
     @BeforeEach
     void setUp() {
-        parser = new ChainhookPayloadParser();
+        chainhookMapper = org.mapstruct.factory.Mappers.getMapper(com.stacksmonitoring.infrastructure.mapper.ChainhookMapper.class);
+        parser = new ChainhookPayloadParser(chainhookMapper);
     }
 
     @Test
