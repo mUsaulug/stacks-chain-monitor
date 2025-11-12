@@ -34,11 +34,24 @@ class ProcessChainhookPayloadUseCaseTest {
     @Mock
     private StacksBlockRepository blockRepository;
 
+    @Mock
+    private com.stacksmonitoring.domain.repository.StacksTransactionRepository transactionRepository;
+
+    @Mock
+    private com.stacksmonitoring.application.service.AlertMatchingService alertMatchingService;
+
+    @Mock
+    private org.springframework.context.ApplicationEventPublisher eventPublisher;
+
+    @Mock
+    private com.stacksmonitoring.domain.repository.AlertNotificationRepository alertNotificationRepository;
+
     private ProcessChainhookPayloadUseCase useCase;
 
     @BeforeEach
     void setUp() {
-        useCase = new ProcessChainhookPayloadUseCase(parser, blockRepository);
+        useCase = new ProcessChainhookPayloadUseCase(parser, blockRepository, transactionRepository,
+            alertMatchingService, eventPublisher, alertNotificationRepository);
     }
 
     @Test
@@ -272,7 +285,7 @@ class ProcessChainhookPayloadUseCaseTest {
         TransactionMetadataDto metadata = new TransactionMetadataDto();
         metadata.setSender("SP123");
         metadata.setSuccess(true);
-        metadata.setFee(1000L);
+        metadata.setFee("1000");
 
         PositionDto position = new PositionDto();
         position.setIndex(0);

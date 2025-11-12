@@ -44,17 +44,23 @@ class NotificationServicesTest {
     @Mock
     private RestTemplate restTemplate;
 
+    @Mock
+    private DeadLetterQueueService dlqService;
+
+    @Mock
+    private AlertNotificationRepository notificationRepository;
+
     private EmailNotificationService emailService;
     private WebhookNotificationService webhookService;
 
     @BeforeEach
     void setUp() {
-        emailService = new EmailNotificationService(mailSender);
+        emailService = new EmailNotificationService(mailSender, dlqService, notificationRepository);
         ReflectionTestUtils.setField(emailService, "emailEnabled", true);
         ReflectionTestUtils.setField(emailService, "fromEmail", "test@example.com");
 
         ObjectMapper objectMapper = new ObjectMapper();
-        webhookService = new WebhookNotificationService(restTemplate, objectMapper);
+        webhookService = new WebhookNotificationService(restTemplate, objectMapper, dlqService, notificationRepository);
     }
 
     // EmailNotificationService Tests

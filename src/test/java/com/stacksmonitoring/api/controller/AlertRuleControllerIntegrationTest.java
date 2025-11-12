@@ -106,7 +106,7 @@ class AlertRuleControllerIntegrationTest {
         ContractCallAlertRule mockRule = new ContractCallAlertRule();
         mockRule.setId(1L);
         mockRule.setRuleName("Active Rule");
-        mockRule.setIsActive(true);
+        mockRule.setActive(true);
 
         when(alertRuleService.getActiveUserRules(anyString())).thenReturn(List.of(mockRule));
 
@@ -146,7 +146,7 @@ class AlertRuleControllerIntegrationTest {
         Long ruleId = 1L;
         ContractCallAlertRule mockRule = new ContractCallAlertRule();
         mockRule.setId(ruleId);
-        mockRule.setIsActive(true);
+        mockRule.setActive(true);
 
         when(alertRuleService.updateRuleStatus(ruleId, true)).thenReturn(mockRule);
 
@@ -166,7 +166,7 @@ class AlertRuleControllerIntegrationTest {
         Long ruleId = 1L;
         ContractCallAlertRule mockRule = new ContractCallAlertRule();
         mockRule.setId(ruleId);
-        mockRule.setIsActive(false);
+        mockRule.setActive(false);
 
         when(alertRuleService.updateRuleStatus(ruleId, false)).thenReturn(mockRule);
 
