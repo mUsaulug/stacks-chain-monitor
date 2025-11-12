@@ -22,13 +22,13 @@ services:
     networks:
       - stacks-monitor-network
 
-  # Redis (for production caching - optional for MVP)
+  # Redis (for caching and rate limiting)
   redis:
     image: redis:7-alpine
     container_name: stacks-monitor-redis
     ports:
       - "6379:6379"
-    command: redis-server --requirepass redis_password
+    command: redis-server
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -36,8 +36,6 @@ services:
       retries: 5
     networks:
       - stacks-monitor-network
-    profiles:
-      - production
 
   # Prometheus (monitoring)
   prometheus:

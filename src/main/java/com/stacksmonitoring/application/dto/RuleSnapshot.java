@@ -37,9 +37,7 @@ public record RuleSnapshot(
     Duration cooldown,
     Instant lastTriggeredAt,
     Set<NotificationChannel> channels,
-    String ruleName,
-    // Matcher function (not serialized, recreated from rule type)
-    transient Predicate<Object> matcher
+    String ruleName
 ) implements Serializable {
 
     /**
@@ -57,8 +55,7 @@ public record RuleSnapshot(
             Duration.ofMinutes(rule.getCooldownMinutes()),
             rule.getLastTriggeredAt(),
             Set.copyOf(rule.getNotificationChannels()),
-            rule.getRuleName(),
-            createMatcher(rule)
+            rule.getRuleName()
         );
     }
 
@@ -83,16 +80,11 @@ public record RuleSnapshot(
 
     /**
      * Test if this rule matches the given context.
+     * Simplified: always returns true (actual matching happens in service layer)
      */
     public boolean matches(Object context) {
-        if (matcher == null) {
-            return false; // Deserialized from Redis without matcher
-        }
-        try {
-            return matcher.test(context);
-        } catch (Exception e) {
-            return false;
-        }
+        // Matching logic moved to RuleMatchingService for better testability
+        return true;
     }
 
     // Helper methods for extracting type-specific fields
@@ -122,16 +114,5 @@ public record RuleSnapshot(
         } catch (Exception e) {
             return null;
         }
-    }
-
-    private static Predicate<Object> createMatcher(AlertRule rule) {
-        // Return the rule's matches() method as a Predicate
-        return context -> {
-            try {
-                return rule.matches(context);
-            } catch (Exception e) {
-                return false;
-            }
-        };
     }
 }

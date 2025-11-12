@@ -141,7 +141,7 @@ public class TokenRevocationService {
      * - Reduces database size and improves query performance
      * - Prevents unbounded growth of revocation table
      *
-     * Cron: 0 0 */6 * * * (every 6 hours at minute 0)
+     * Cron expression: 0 0 star-slash-6 * * * (every 6 hours at minute 0)
      */
     @Scheduled(cron = "0 0 */6 * * *")
     @Transactional

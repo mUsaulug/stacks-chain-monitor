@@ -160,7 +160,7 @@ public class ChainhookPayloadParser {
     private NFTMintEvent createNFTMintEvent(EventDto eventDto) {
         NFTMintEvent event = new NFTMintEvent();
         event.setAssetIdentifier(chainhookMapper.extractAssetIdentifier(eventDto.getData()));
-        event.setAssetId(chainhookMapper.extractValue(eventDto.getData()));
+        event.setRawValue(chainhookMapper.extractValue(eventDto.getData()));
         event.setRecipient(chainhookMapper.extractRecipient(eventDto.getData()));
         event.setContractIdentifier(chainhookMapper.extractContractFromAsset(eventDto.getData()));
         event.setEventType(EventType.NFT_MINT);
@@ -171,7 +171,7 @@ public class ChainhookPayloadParser {
     private NFTBurnEvent createNFTBurnEvent(EventDto eventDto) {
         NFTBurnEvent event = new NFTBurnEvent();
         event.setAssetIdentifier(chainhookMapper.extractAssetIdentifier(eventDto.getData()));
-        event.setAssetId(chainhookMapper.extractValue(eventDto.getData()));
+        event.setRawValue(chainhookMapper.extractValue(eventDto.getData()));
         event.setSender(chainhookMapper.extractSender(eventDto.getData()));
         event.setContractIdentifier(chainhookMapper.extractContractFromAsset(eventDto.getData()));
         event.setEventType(EventType.NFT_BURN);
@@ -199,8 +199,8 @@ public class ChainhookPayloadParser {
 
     private STXLockEvent createSTXLockEvent(EventDto eventDto) {
         STXLockEvent event = new STXLockEvent();
-        event.setAmount(chainhookMapper.extractAmount(eventDto.getData()));
-        event.setAddress(chainhookMapper.extractStringValue(eventDto.getData(), "address"));
+        event.setLockAmount(chainhookMapper.extractAmount(eventDto.getData()));
+        event.setLockedAddress(chainhookMapper.extractStringValue(eventDto.getData(), "address"));
 
         // Extract unlock_height as Long
         Object unlockHeight = eventDto.getData().get("unlock_height");

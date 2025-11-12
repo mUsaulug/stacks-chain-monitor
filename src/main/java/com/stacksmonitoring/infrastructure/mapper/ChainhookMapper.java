@@ -7,6 +7,7 @@ import com.stacksmonitoring.domain.valueobject.TransactionType;
 import org.mapstruct.*;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -113,7 +114,8 @@ public interface ChainhookMapper {
      * Map EventDto to NFTTransferEvent.
      */
     @Mapping(target = "assetIdentifier", source = "data", qualifiedByName = "extractString:asset_identifier")
-    @Mapping(target = "assetId", source = "data", qualifiedByName = "extractString:value")
+    @Mapping(target = "assetClassIdentifier", source = "data", qualifiedByName = "extractContractFromAsset")
+    @Mapping(target = "rawValue", source = "data", qualifiedByName = "extractString:value")
     @Mapping(target = "sender", source = "data", qualifiedByName = "extractString:sender")
     @Mapping(target = "recipient", source = "data", qualifiedByName = "extractString:recipient")
     @Mapping(target = "contractIdentifier", source = "data", qualifiedByName = "extractContractFromAsset")
@@ -184,14 +186,15 @@ public interface ChainhookMapper {
      */
     @Named("stringToTransactionType")
     default TransactionType stringToTransactionType(String type) {
-        if (type == null) return TransactionType.UNKNOWN;
+        if (type == null) return TransactionType.TOKEN_TRANSFER; // Default fallback
         return switch (type.toUpperCase()) {
             case "CONTRACTCALL" -> TransactionType.CONTRACT_CALL;
-            case "CONTRACTDEPLOYMENT" -> TransactionType.CONTRACT_DEPLOYMENT;
+            case "CONTRACTDEPLOYMENT", "SMARTCONTRACT" -> TransactionType.SMART_CONTRACT;
             case "TOKENTRANSFER" -> TransactionType.TOKEN_TRANSFER;
             case "COINBASE" -> TransactionType.COINBASE;
             case "POISONMICROBLOCK" -> TransactionType.POISON_MICROBLOCK;
-            default -> TransactionType.UNKNOWN;
+            case "TENURECHANGE" -> TransactionType.TENURE_CHANGE;
+            default -> TransactionType.TOKEN_TRANSFER; // Unknown types default to TOKEN_TRANSFER
         };
     }
 

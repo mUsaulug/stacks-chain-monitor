@@ -182,7 +182,7 @@ public class TransactionQueryController {
             response.setSuccess(transaction.getSuccess());
             response.setTxIndex(transaction.getTxIndex());
             response.setNonce(transaction.getNonce());
-            response.setFeeRate(transaction.getFeeRate());
+            // response.setFeeRate(transaction.getFeeRate()); // Field removed - use fee instead
             response.setExecutionCostReadCount(transaction.getExecutionCostReadCount());
             response.setExecutionCostReadLength(transaction.getExecutionCostReadLength());
             response.setExecutionCostRuntime(transaction.getExecutionCostRuntime());

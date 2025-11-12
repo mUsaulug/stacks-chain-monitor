@@ -135,13 +135,13 @@ public class JwtTokenService {
      * Uses public key for verification with clock skew tolerance.
      */
     private Claims extractAllClaims(String token) {
-        return Jwts.parserBuilder()
-                .setSigningKey(publicKey)
+        return Jwts.parser()
+                .verifyWith(publicKey)
                 .requireIssuer(issuer)
-                .setAllowedClockSkewSeconds(60) // 1-minute clock skew tolerance
+                .clockSkewSeconds(60) // 1-minute clock skew tolerance
                 .build()
-                .parseClaimsJws(token)
-                .getBody();
+                .parseSignedClaims(token)
+                .getPayload();
     }
 
     /**
