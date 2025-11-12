@@ -53,8 +53,15 @@ class AlertMatchingServiceTest {
 
         ContractCallAlertRule rule = createContractCallRule();
 
-        when(alertRuleRepository.findActiveByRuleType(AlertRuleType.CONTRACT_CALL))
-                .thenReturn(List.of(rule));
+        // Mock index building (getRuleIndex calls findAllActive)
+        when(alertRuleRepository.findAllActive()).thenReturn(List.of(rule));
+
+        // Mock atomic cooldown check (returns 1 = successfully triggered)
+        when(alertRuleRepository.markTriggeredIfOutOfCooldown(any(), any(), any())).thenReturn(1);
+
+        // Mock full entity reload after cooldown check
+        when(alertRuleRepository.findById(rule.getId())).thenReturn(java.util.Optional.of(rule));
+
         when(alertNotificationRepository.save(any())).thenAnswer(i -> i.getArguments()[0]);
 
         // When
@@ -63,7 +70,6 @@ class AlertMatchingServiceTest {
         // Then
         assertThat(notifications).hasSize(1);
         verify(alertNotificationRepository, times(1)).save(any(AlertNotification.class));
-        verify(alertRuleRepository, times(1)).save(rule); // Rule updated with last triggered
     }
 
     @Test
@@ -82,8 +88,10 @@ class AlertMatchingServiceTest {
 
         TokenTransferAlertRule rule = createTokenTransferRule();
 
-        when(alertRuleRepository.findActiveByRuleType(AlertRuleType.TOKEN_TRANSFER))
-                .thenReturn(List.of(rule));
+        // Mock index building
+        when(alertRuleRepository.findAllActive()).thenReturn(List.of(rule));
+        when(alertRuleRepository.markTriggeredIfOutOfCooldown(any(), any(), any())).thenReturn(1);
+        when(alertRuleRepository.findById(rule.getId())).thenReturn(java.util.Optional.of(rule));
         when(alertNotificationRepository.save(any())).thenAnswer(i -> i.getArguments()[0]);
 
         // When
@@ -107,8 +115,11 @@ class AlertMatchingServiceTest {
         rule.setLastTriggeredAt(Instant.now().minusSeconds(30 * 60)); // 30 minutes ago
         rule.setCooldownMinutes(60); // 1 hour cooldown
 
-        when(alertRuleRepository.findActiveByRuleType(AlertRuleType.CONTRACT_CALL))
-                .thenReturn(List.of(rule));
+        // Mock index building
+        when(alertRuleRepository.findAllActive()).thenReturn(List.of(rule));
+
+        // Mock atomic cooldown check (returns 0 = cooldown active, no update)
+        when(alertRuleRepository.markTriggeredIfOutOfCooldown(any(), any(), any())).thenReturn(0);
 
         // When
         List<AlertNotification> notifications = alertMatchingService.evaluateTransaction(transaction);
@@ -130,8 +141,10 @@ class AlertMatchingServiceTest {
         ContractCallAlertRule rule = createContractCallRule();
         rule.setNotificationChannels(List.of(NotificationChannel.EMAIL, NotificationChannel.WEBHOOK));
 
-        when(alertRuleRepository.findActiveByRuleType(AlertRuleType.CONTRACT_CALL))
-                .thenReturn(List.of(rule));
+        // Mock index building
+        when(alertRuleRepository.findAllActive()).thenReturn(List.of(rule));
+        when(alertRuleRepository.markTriggeredIfOutOfCooldown(any(), any(), any())).thenReturn(1);
+        when(alertRuleRepository.findById(rule.getId())).thenReturn(java.util.Optional.of(rule));
         when(alertNotificationRepository.save(any())).thenAnswer(i -> i.getArguments()[0]);
 
         // When
@@ -155,8 +168,10 @@ class AlertMatchingServiceTest {
         rule.setNotificationChannels(List.of(NotificationChannel.EMAIL));
         rule.setRuleName("Failed Transaction Alert");
 
-        when(alertRuleRepository.findActiveByRuleType(AlertRuleType.FAILED_TRANSACTION))
-                .thenReturn(List.of(rule));
+        // Mock index building
+        when(alertRuleRepository.findAllActive()).thenReturn(List.of(rule));
+        when(alertRuleRepository.markTriggeredIfOutOfCooldown(any(), any(), any())).thenReturn(1);
+        when(alertRuleRepository.findById(rule.getId())).thenReturn(java.util.Optional.of(rule));
         when(alertNotificationRepository.save(any())).thenAnswer(i -> i.getArguments()[0]);
 
         // When
@@ -178,8 +193,8 @@ class AlertMatchingServiceTest {
 
         ContractCallAlertRule rule = createContractCallRule();
 
-        when(alertRuleRepository.findActiveByRuleType(AlertRuleType.CONTRACT_CALL))
-                .thenReturn(List.of(rule));
+        // Mock index building (rule exists but won't match SP999.other-contract)
+        when(alertRuleRepository.findAllActive()).thenReturn(List.of(rule));
 
         // When
         List<AlertNotification> notifications = alertMatchingService.evaluateTransaction(transaction);
@@ -204,8 +219,10 @@ class AlertMatchingServiceTest {
         TokenTransferAlertRule rule = createTokenTransferRule();
         rule.setAmountThreshold(new BigDecimal("1000"));
 
-        when(alertRuleRepository.findActiveByRuleType(AlertRuleType.TOKEN_TRANSFER))
-                .thenReturn(List.of(rule));
+        // Mock index building
+        when(alertRuleRepository.findAllActive()).thenReturn(List.of(rule));
+        when(alertRuleRepository.markTriggeredIfOutOfCooldown(any(), any(), any())).thenReturn(1);
+        when(alertRuleRepository.findById(rule.getId())).thenReturn(java.util.Optional.of(rule));
         when(alertNotificationRepository.save(any())).thenAnswer(i -> i.getArguments()[0]);
 
         // When
@@ -230,8 +247,8 @@ class AlertMatchingServiceTest {
         TokenTransferAlertRule rule = createTokenTransferRule();
         rule.setAmountThreshold(new BigDecimal("1000"));
 
-        when(alertRuleRepository.findActiveByRuleType(AlertRuleType.TOKEN_TRANSFER))
-                .thenReturn(List.of(rule));
+        // Mock index building (rule won't match because amount is below threshold)
+        when(alertRuleRepository.findAllActive()).thenReturn(List.of(rule));
 
         // When
         List<AlertNotification> notifications = alertMatchingService.evaluateTransaction(transaction);

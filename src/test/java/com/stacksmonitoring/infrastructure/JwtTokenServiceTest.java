@@ -8,12 +8,14 @@ import org.springframework.security.core.userdetails.User;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.util.Collections;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Unit tests for JWT Token Service.
+ * Unit tests for JWT Token Service (RS256).
  */
 class JwtTokenServiceTest {
 
@@ -21,13 +23,20 @@ class JwtTokenServiceTest {
     private UserDetails userDetails;
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws Exception {
         jwtTokenService = new JwtTokenService();
 
+        // Generate test RSA key pair (2048-bit for faster test execution)
+        KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("RSA");
+        keyPairGenerator.initialize(2048);
+        KeyPair keyPair = keyPairGenerator.generateKeyPair();
+
         // Set test values using reflection
-        ReflectionTestUtils.setField(jwtTokenService, "secretKey", "test-secret-key-must-be-at-least-256-bits-long-for-hs256-algorithm");
+        ReflectionTestUtils.setField(jwtTokenService, "privateKey", keyPair.getPrivate());
+        ReflectionTestUtils.setField(jwtTokenService, "publicKey", keyPair.getPublic());
         ReflectionTestUtils.setField(jwtTokenService, "expirationMs", 3600000L);
         ReflectionTestUtils.setField(jwtTokenService, "issuer", "stacks-chain-monitor-test");
+        ReflectionTestUtils.setField(jwtTokenService, "currentKeyId", "test-key-id");
 
         userDetails = User.builder()
                 .username("test@example.com")

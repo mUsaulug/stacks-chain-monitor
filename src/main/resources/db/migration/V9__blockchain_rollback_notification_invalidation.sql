@@ -43,9 +43,7 @@ CREATE INDEX IF NOT EXISTS idx_tx_block
 -- ============================================================
 
 COMMENT ON COLUMN alert_notification.invalidated IS
-    'Marks notification as invalidated due to blockchain reorg. ' ||
-    'Notification WAS sent legitimately but underlying blockchain data became invalid. ' ||
-    'Different from soft-delete - preserves audit trail.';
+    'Marks notification as invalidated due to blockchain reorg. Notification WAS sent legitimately but underlying blockchain data became invalid. Different from soft-delete - preserves audit trail.';
 
 COMMENT ON COLUMN alert_notification.invalidated_at IS
     'Timestamp when notification was invalidated (blockchain reorg detected). Uses TIMESTAMPTZ for timezone safety.';
@@ -54,19 +52,16 @@ COMMENT ON COLUMN alert_notification.invalidation_reason IS
     'Why notification was invalidated: BLOCKCHAIN_REORG (common), MANUAL (admin action), etc.';
 
 COMMENT ON INDEX idx_notification_active_partial IS
-    'Partial index: Fast queries for active notifications (invalidated = FALSE). ' ||
-    'Used by dispatcher to skip invalidated notifications.';
+    'Partial index: Fast queries for active notifications (invalidated = FALSE). Used by dispatcher to skip invalidated notifications.';
 
 COMMENT ON INDEX idx_notification_invalidated IS
-    'Partial index: Fast audit queries for invalidated notifications. ' ||
-    'Used by admin dashboard to investigate blockchain reorgs.';
+    'Partial index: Fast audit queries for invalidated notifications. Used by admin dashboard to investigate blockchain reorgs.';
 
 COMMENT ON INDEX idx_notification_tx IS
     'Performance: Fast lookup of notifications by transaction for bulk invalidation during rollback.';
 
 COMMENT ON INDEX idx_tx_block IS
-    'Performance: Fast lookup of transactions by block for rollback cascade. ' ||
-    'Critical for bulk invalidation query performance.';
+    'Performance: Fast lookup of transactions by block for rollback cascade. Critical for bulk invalidation query performance.';
 
 -- ============================================================
 -- BULK INVALIDATION SUPPORT (Performance Optimization)
