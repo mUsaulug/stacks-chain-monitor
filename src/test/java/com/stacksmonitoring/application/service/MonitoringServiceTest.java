@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 
 import java.util.Collections;
@@ -124,7 +125,9 @@ class MonitoringServiceTest {
     @Test
     void testGetCacheStatistics_WithCache_ShouldReturnCacheStats() {
         // Given
+        Cache mockCache = mock(Cache.class);
         when(cacheManager.getCacheNames()).thenReturn(List.of("alertRules"));
+        when(cacheManager.getCache("alertRules")).thenReturn(mockCache);
 
         // When
         var stats = monitoringService.getCacheStatistics();

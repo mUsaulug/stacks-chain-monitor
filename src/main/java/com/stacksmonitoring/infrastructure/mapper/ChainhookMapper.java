@@ -189,7 +189,8 @@ public interface ChainhookMapper {
         if (type == null) return TransactionType.TOKEN_TRANSFER; // Default fallback
         return switch (type.toUpperCase()) {
             case "CONTRACTCALL" -> TransactionType.CONTRACT_CALL;
-            case "CONTRACTDEPLOYMENT", "SMARTCONTRACT" -> TransactionType.SMART_CONTRACT;
+            case "CONTRACTDEPLOYMENT" -> TransactionType.CONTRACT_DEPLOYMENT;
+            case "SMARTCONTRACT" -> TransactionType.SMART_CONTRACT;
             case "TOKENTRANSFER" -> TransactionType.TOKEN_TRANSFER;
             case "COINBASE" -> TransactionType.COINBASE;
             case "POISONMICROBLOCK" -> TransactionType.POISON_MICROBLOCK;

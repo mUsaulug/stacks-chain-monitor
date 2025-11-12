@@ -1,6 +1,9 @@
 package com.stacksmonitoring.infrastructure;
 
 import com.stacksmonitoring.infrastructure.config.RateLimitFilter;
+import io.github.bucket4j.Bucket;
+import io.github.bucket4j.BucketConfiguration;
+import io.github.bucket4j.distributed.proxy.ProxyManager;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -12,13 +15,22 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.util.function.Supplier;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
 /**
- * Unit tests for Rate Limit Filter.
+ * Unit tests for Rate Limit Filter (Redis-backed).
+ * Note: These tests mock the Redis ProxyManager for unit testing.
+ * For full integration testing with Redis, see RateLimitIntegrationTest.
  */
 @ExtendWith(MockitoExtension.class)
 class RateLimitFilterTest {
+
+    @Mock
+    private ProxyManager<String> proxyManager;
 
     @Mock
     private HttpServletRequest request;
@@ -29,6 +41,9 @@ class RateLimitFilterTest {
     @Mock
     private FilterChain filterChain;
 
+    @Mock
+    private Bucket bucket;
+
     @InjectMocks
     private RateLimitFilter rateLimitFilter;
 
@@ -36,8 +51,18 @@ class RateLimitFilterTest {
     void setUp() {
         ReflectionTestUtils.setField(rateLimitFilter, "rateLimitEnabled", true);
         ReflectionTestUtils.setField(rateLimitFilter, "requestsPerMinute", 5);
+        ReflectionTestUtils.setField(rateLimitFilter, "proxyManager", proxyManager);
 
         when(request.getRemoteAddr()).thenReturn("127.0.0.1");
+
+        // Mock ProxyManager to return our mock bucket
+        @SuppressWarnings("unchecked")
+        ProxyManager.BucketBuilder<String> bucketBuilder = mock(ProxyManager.BucketBuilder.class);
+        when(proxyManager.builder()).thenReturn(bucketBuilder);
+        when(bucketBuilder.build(anyString(), any(Supplier.class))).thenReturn(bucket);
+
+        // Default: bucket has tokens available
+        when(bucket.tryConsume(1)).thenReturn(true);
     }
 
     @Test
@@ -52,17 +77,11 @@ class RateLimitFilterTest {
 
     @Test
     void shouldRejectRequestWhenOverLimit() throws Exception {
-        // Given - consume all tokens
-        for (int i = 0; i < 5; i++) {
-            rateLimitFilter.doFilter(request, response, filterChain);
-        }
-
-        // Reset mocks
-        reset(filterChain, response);
-        when(request.getRemoteAddr()).thenReturn("127.0.0.1");
+        // Given - bucket has no tokens
+        when(bucket.tryConsume(1)).thenReturn(false);
         when(response.getWriter()).thenReturn(mock(java.io.PrintWriter.class));
 
-        // When - make one more request (should be rejected)
+        // When - make request (should be rejected)
         rateLimitFilter.doFilter(request, response, filterChain);
 
         // Then

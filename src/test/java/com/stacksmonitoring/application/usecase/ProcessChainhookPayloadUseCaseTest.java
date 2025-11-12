@@ -20,6 +20,7 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 /**
@@ -83,10 +84,14 @@ class ProcessChainhookPayloadUseCaseTest {
         ChainhookPayloadDto payload = createTestPayload(0, 1);
 
         StacksBlock existingBlock = createTestBlock(100L, "0xblock100");
+        existingBlock.setId(1L); // Need ID for bulk invalidation
         existingBlock.setDeleted(false);
 
         when(blockRepository.findByBlockHash("0xblock100")).thenReturn(Optional.of(existingBlock));
         when(blockRepository.save(any())).thenAnswer(i -> i.getArguments()[0]);
+
+        // Mock bulk invalidation (V9 feature)
+        when(alertNotificationRepository.bulkInvalidateByBlockId(any(), any(), any())).thenReturn(5);
 
         // When
         ProcessChainhookPayloadUseCase.ProcessingResult result = useCase.processPayload(payload);
@@ -102,6 +107,9 @@ class ProcessChainhookPayloadUseCaseTest {
         StacksBlock savedBlock = blockCaptor.getValue();
         assertThat(savedBlock.getDeleted()).isTrue();
         assertThat(savedBlock.getDeletedAt()).isNotNull();
+
+        // Verify bulk invalidation was called
+        verify(alertNotificationRepository).bulkInvalidateByBlockId(eq(1L), any(), eq("BLOCKCHAIN_REORG"));
     }
 
     @Test
@@ -110,6 +118,7 @@ class ProcessChainhookPayloadUseCaseTest {
         ChainhookPayloadDto payload = createTestPayload(1, 1);
 
         StacksBlock existingBlock = createTestBlock(99L, "0xblock99");
+        existingBlock.setId(1L); // Need ID for bulk invalidation
         StacksBlock newBlock = createTestBlock(100L, "0xblock100");
 
         when(parser.parseBlock(any())).thenReturn(newBlock);
@@ -117,6 +126,9 @@ class ProcessChainhookPayloadUseCaseTest {
         when(blockRepository.findByBlockHash("0xblock99")).thenReturn(Optional.of(existingBlock));
         when(blockRepository.findByBlockHash("0xblock100")).thenReturn(Optional.empty());
         when(blockRepository.save(any())).thenAnswer(i -> i.getArguments()[0]);
+
+        // Mock bulk invalidation (V9 feature)
+        when(alertNotificationRepository.bulkInvalidateByBlockId(any(), any(), any())).thenReturn(0);
 
         // When
         ProcessChainhookPayloadUseCase.ProcessingResult result = useCase.processPayload(payload);
