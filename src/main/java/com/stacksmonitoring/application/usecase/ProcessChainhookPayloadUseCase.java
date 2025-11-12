@@ -142,13 +142,8 @@ public class ProcessChainhookPayloadUseCase {
                     tx.getEvents().forEach(event -> event.markAsDeleted());
                 }
 
-                // Cascade to contract call/deployment (if exists)
-                if (tx.getContractCall() != null) {
-                    tx.getContractCall().markAsDeleted();
-                }
-                if (tx.getContractDeployment() != null) {
-                    tx.getContractDeployment().markAsDeleted();
-                }
+                // Note: ContractCall and ContractDeployment don't need soft delete
+                // They are OneToOne with Transaction and will be filtered via parent's @Where clause
             });
 
             // Count events for logging
