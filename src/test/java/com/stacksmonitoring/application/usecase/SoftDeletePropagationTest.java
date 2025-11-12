@@ -278,7 +278,7 @@ class SoftDeletePropagationTest {
             event.setAssetIdentifier("STX");
             event.setSender("SP111");
             event.setRecipient("SP222");
-            event.setAmount(1000L);
+            event.setAmount(java.math.BigDecimal.valueOf(1000L));
             event.setDeleted(false);
 
             tx.getEvents().add(event);

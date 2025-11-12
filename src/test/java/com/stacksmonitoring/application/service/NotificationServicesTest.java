@@ -5,6 +5,7 @@ import com.stacksmonitoring.domain.model.blockchain.StacksBlock;
 import com.stacksmonitoring.domain.model.blockchain.StacksTransaction;
 import com.stacksmonitoring.domain.model.monitoring.AlertNotification;
 import com.stacksmonitoring.domain.model.monitoring.ContractCallAlertRule;
+import com.stacksmonitoring.domain.repository.AlertNotificationRepository;
 import com.stacksmonitoring.domain.valueobject.AlertSeverity;
 import com.stacksmonitoring.domain.valueobject.NotificationChannel;
 import org.junit.jupiter.api.BeforeEach;
