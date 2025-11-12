@@ -185,7 +185,7 @@ class ChainhookPayloadParserTest {
         assertThat(event).isInstanceOf(NFTTransferEvent.class);
         NFTTransferEvent nftEvent = (NFTTransferEvent) event;
         assertThat(nftEvent.getAssetIdentifier()).isEqualTo("SP123.nft::my-nft");
-        assertThat(nftEvent.getAssetId()).isEqualTo("42");
+        assertThat(nftEvent.getRawValue()).isEqualTo("42");
         assertThat(nftEvent.getSender()).isEqualTo("SP111");
         assertThat(nftEvent.getRecipient()).isEqualTo("SP222");
     }

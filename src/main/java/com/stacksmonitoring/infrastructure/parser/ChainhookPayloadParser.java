@@ -90,8 +90,9 @@ public class ChainhookPayloadParser {
     /**
      * Parse a single event DTO to appropriate TransactionEvent subtype.
      * Uses MapStruct for type-safe mapping and EventType.fromWireFormat() for type resolution.
+     * Package-private for testing.
      */
-    private TransactionEvent parseEvent(EventDto eventDto, StacksTransaction transaction, int index) {
+    TransactionEvent parseEvent(EventDto eventDto, StacksTransaction transaction, int index) {
         String eventTypeString = eventDto.getType();
         if (eventTypeString == null) {
             log.warn("Event type is null, skipping event at index {}", index);

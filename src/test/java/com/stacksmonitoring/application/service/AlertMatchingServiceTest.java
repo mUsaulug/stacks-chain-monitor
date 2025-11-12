@@ -240,21 +240,22 @@ class AlertMatchingServiceTest {
         assertThat(notifications).isEmpty();
     }
 
-    @Test
-    void testGetActiveRulesByType_ShouldReturnCachedRules() {
-        // Given
-        AlertRuleType ruleType = AlertRuleType.CONTRACT_CALL;
-        List<AlertRule> rules = List.of(createContractCallRule());
-
-        when(alertRuleRepository.findActiveByRuleType(ruleType)).thenReturn(rules);
-
-        // When
-        List<AlertRule> result = alertMatchingService.getActiveRulesByType(ruleType);
-
-        // Then
-        assertThat(result).hasSize(1);
-        verify(alertRuleRepository, times(1)).findActiveByRuleType(ruleType);
-    }
+    // Note: getActiveRulesByType() is in AlertRuleService, not AlertMatchingService
+    // @Test
+    // void testGetActiveRulesByType_ShouldReturnCachedRules() {
+    //     // Given
+    //     AlertRuleType ruleType = AlertRuleType.CONTRACT_CALL;
+    //     List<AlertRule> rules = List.of(createContractCallRule());
+    //
+    //     when(alertRuleRepository.findActiveByRuleType(ruleType)).thenReturn(rules);
+    //
+    //     // When
+    //     List<AlertRule> result = alertMatchingService.getActiveRulesByType(ruleType);
+    //
+    //     // Then
+    //     assertThat(result).hasSize(1);
+    //     verify(alertRuleRepository, times(1)).findActiveByRuleType(ruleType);
+    // }
 
     // Helper methods
 

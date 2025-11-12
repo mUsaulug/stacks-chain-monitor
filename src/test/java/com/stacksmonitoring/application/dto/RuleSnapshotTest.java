@@ -50,7 +50,7 @@ class RuleSnapshotTest {
         assertThat(snapshot.cooldown()).isEqualTo(Duration.ofMinutes(30));
         assertThat(snapshot.lastTriggeredAt()).isEqualTo(Instant.parse("2025-01-01T10:00:00Z"));
         assertThat(snapshot.channels()).containsExactlyInAnyOrder(NotificationChannel.EMAIL, NotificationChannel.WEBHOOK);
-        assertThat(snapshot.matcher()).isNotNull();
+        // Note: matcher() method removed - matching logic in service layer
     }
 
     @Test
