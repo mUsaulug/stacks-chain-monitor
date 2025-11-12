@@ -116,7 +116,7 @@ public class AlertMatchingService {
         List<AlertNotification> notifications = new ArrayList<>();
 
         // Token transfer events - O(1) lookup by asset
-        if (event instanceof FungibleTokenTransferEvent ftEvent) {
+        if (event instanceof FTTransferEvent ftEvent) {
             RuleIndex index = getRuleIndex();
             List<RuleSnapshot> candidates = index.getCandidatesForTokenTransfer(
                 ftEvent.getAssetIdentifier()
