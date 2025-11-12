@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  test:
+    image: maven:3.9-eclipse-temurin-17-alpine
+    container_name: stacks-monitor-test
+    working_dir: /app
+    volumes:
+      - .:/app
+      - maven-cache:/root/.m2
+    command: mvn clean test
+    environment:
+      # TestContainers will start its own PostgreSQL
+      - TESTCONTAINERS_RYUK_DISABLED=false
+    # Mount Docker socket for TestContainers
+    volumes:
+      - .:/app
+      - maven-cache:/root/.m2
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  maven-cache:
+    driver: local
