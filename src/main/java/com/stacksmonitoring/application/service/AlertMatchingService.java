@@ -3,7 +3,7 @@ package com.stacksmonitoring.application.service;
 import com.stacksmonitoring.application.dto.RuleIndex;
 import com.stacksmonitoring.application.dto.RuleSnapshot;
 import com.stacksmonitoring.domain.model.blockchain.ContractCall;
-import com.stacksmonitoring.domain.model.blockchain.FungibleTokenTransferEvent;
+import com.stacksmonitoring.domain.model.blockchain.FTTransferEvent;
 import com.stacksmonitoring.domain.model.blockchain.StacksTransaction;
 import com.stacksmonitoring.domain.model.blockchain.TransactionEvent;
 import com.stacksmonitoring.domain.model.monitoring.AlertNotification;
