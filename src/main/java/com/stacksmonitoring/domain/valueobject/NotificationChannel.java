@@ -5,5 +5,6 @@ package com.stacksmonitoring.domain.valueobject;
  */
 public enum NotificationChannel {
     EMAIL,
-    WEBHOOK
+    WEBHOOK,
+    SLACK
 }

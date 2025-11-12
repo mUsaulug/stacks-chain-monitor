@@ -213,7 +213,7 @@ class WebhookControllerIntegrationTest {
         TransactionMetadataDto metadata = new TransactionMetadataDto();
         metadata.setSender(sender);
         metadata.setSuccess(true);
-        metadata.setFee(1000L);
+        metadata.setFee("1000");
 
         PositionDto position = new PositionDto();
         position.setIndex(0);

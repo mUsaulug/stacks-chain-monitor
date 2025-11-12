@@ -9,6 +9,7 @@ import com.stacksmonitoring.domain.model.blockchain.StacksTransaction;
 import com.stacksmonitoring.domain.model.blockchain.TransactionEvent;
 import com.stacksmonitoring.domain.model.monitoring.AlertNotification;
 import com.stacksmonitoring.domain.model.monitoring.AlertRule;
+import com.stacksmonitoring.domain.model.monitoring.ContractCallAlertRule;
 import com.stacksmonitoring.domain.model.user.User;
 import com.stacksmonitoring.domain.repository.AlertNotificationRepository;
 import com.stacksmonitoring.domain.repository.StacksBlockRepository;
@@ -84,7 +85,6 @@ class BlockchainRollbackIntegrationTest {
     void setUp() {
         // Create test user for alert rules
         testUser = new User();
-        testUser.setUsername("rollback_test_user");
         testUser.setEmail("test@rollback.com");
         testUser.setPasswordHash("hash");
         testUser = userRepository.save(testUser);
@@ -400,7 +400,7 @@ class BlockchainRollbackIntegrationTest {
         block.setBlockHeight(height);
         block.setTimestamp(Instant.now());
         block.setParentBlockHash("0xparent");
-        block.setMiner("miner");
+        block.setMinerAddress("miner");
         return blockRepository.save(block);
     }
 
@@ -417,10 +417,10 @@ class BlockchainRollbackIntegrationTest {
 
     private AlertNotification createAndSaveNotification(StacksTransaction tx) {
         // Create a minimal alert rule (would normally be more complex)
-        AlertRule rule = new AlertRule();
+        ContractCallAlertRule rule = new ContractCallAlertRule();
         rule.setUser(testUser);
-        rule.setName("Test Rule");
-        rule.setEnabled(true);
+        rule.setRuleName("Test Rule");
+        rule.setActive(true);
 
         AlertNotification notification = new AlertNotification();
         notification.setAlertRule(rule);

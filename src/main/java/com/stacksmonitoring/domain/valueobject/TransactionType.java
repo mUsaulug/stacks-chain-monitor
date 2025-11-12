@@ -6,6 +6,7 @@ package com.stacksmonitoring.domain.valueobject;
 public enum TransactionType {
     TOKEN_TRANSFER,
     SMART_CONTRACT,
+    CONTRACT_DEPLOYMENT,
     CONTRACT_CALL,
     POISON_MICROBLOCK,
     COINBASE,

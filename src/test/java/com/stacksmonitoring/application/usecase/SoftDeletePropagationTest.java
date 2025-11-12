@@ -152,8 +152,8 @@ class SoftDeletePropagationTest {
         block.setIndexBlockHash("0x5678");
         block.setBurnBlockHeight(50000L);
         block.setBurnBlockHash("0xabcd");
-        block.setBurnBlockTime(Instant.now());
-        block.setMinerTxId("0xminer");
+        block.setBurnBlockTimestamp(Instant.now());
+        block.setMinerAddress("0xminer");
         block.setParentBlockHash("0x0000");
         block.setDeleted(false);
         block.setTransactions(new ArrayList<>());
@@ -201,8 +201,8 @@ class SoftDeletePropagationTest {
         block.setIndexBlockHash("0x5678");
         block.setBurnBlockHeight(50000L);
         block.setBurnBlockHash("0xabcd");
-        block.setBurnBlockTime(Instant.now());
-        block.setMinerTxId("0xminer");
+        block.setBurnBlockTimestamp(Instant.now());
+        block.setMinerAddress("0xminer");
         block.setParentBlockHash("0x0000");
         block.setDeleted(false);
         block.setTransactions(new ArrayList<>());
@@ -213,7 +213,7 @@ class SoftDeletePropagationTest {
         tx.setBlock(block);
         tx.setSender("SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR");
         tx.setNonce(0L);
-        tx.setFee(1000L);
+        tx.setFeeMicroStx(java.math.BigInteger.valueOf(1000L));
         tx.setSuccess(true);
         tx.setDeleted(false);
         tx.setEvents(new ArrayList<>()); // Empty events list
@@ -246,8 +246,8 @@ class SoftDeletePropagationTest {
         block.setIndexBlockHash("0x5678");
         block.setBurnBlockHeight(50000L);
         block.setBurnBlockHash("0xabcd");
-        block.setBurnBlockTime(Instant.now());
-        block.setMinerTxId("0xminer");
+        block.setBurnBlockTimestamp(Instant.now());
+        block.setMinerAddress("0xminer");
         block.setParentBlockHash("0x0000");
         block.setDeleted(false);
         block.setTransactions(new ArrayList<>());
@@ -265,13 +265,13 @@ class SoftDeletePropagationTest {
         tx.setBlock(block);
         tx.setSender("SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR");
         tx.setNonce(0L);
-        tx.setFee(1000L);
+        tx.setFeeMicroStx(java.math.BigInteger.valueOf(1000L));
         tx.setSuccess(true);
         tx.setDeleted(false);
         tx.setEvents(new ArrayList<>());
 
         for (int i = 0; i < eventCount; i++) {
-            FungibleTokenTransferEvent event = new FungibleTokenTransferEvent();
+            FTTransferEvent event = new FTTransferEvent();
             event.setTransaction(tx);
             event.setEventIndex(i);
             event.setContractIdentifier("SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.token");

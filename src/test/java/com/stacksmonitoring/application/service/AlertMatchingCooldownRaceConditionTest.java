@@ -78,7 +78,7 @@ class AlertMatchingCooldownRaceConditionTest {
         // Create test user
         testUser = new User();
         testUser.setEmail("test@example.com");
-        testUser.setPassword("password");
+        testUser.setPasswordHash("password");
         testUser = userRepository.save(testUser);
 
         // Create test contract
@@ -93,7 +93,7 @@ class AlertMatchingCooldownRaceConditionTest {
         testRule.setRuleName("Test Cooldown Rule");
         testRule.setRuleType(AlertRuleType.CONTRACT_CALL);
         testRule.setSeverity(AlertSeverity.INFO);
-        testRule.setIsActive(true);
+        testRule.setActive(true);
         testRule.setCooldownMinutes(1); // 1 minute cooldown
         testRule.setNotificationChannels(List.of(NotificationChannel.EMAIL));
         testRule.setNotificationEmails("test@example.com");
@@ -264,8 +264,8 @@ class AlertMatchingCooldownRaceConditionTest {
         block.setIndexBlockHash("0x5678");
         block.setBurnBlockHeight(50000L);
         block.setBurnBlockHash("0xabcd");
-        block.setBurnBlockTime(Instant.now());
-        block.setMinerTxId("0xminer");
+        block.setBurnBlockTimestamp(Instant.now());
+        block.setMinerAddress("0xminer");
         block.setParentBlockHash("0x0000");
         block.setDeleted(false);
         block = stacksBlockRepository.save(block);
@@ -277,8 +277,7 @@ class AlertMatchingCooldownRaceConditionTest {
         transaction.setBlock(block);
         transaction.setSender("SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR");
         transaction.setNonce(0L);
-        transaction.setFee(1000L);
-        transaction.setSponsored(false);
+        transaction.setFeeMicroStx(java.math.BigInteger.valueOf(1000L));
         transaction.setSuccess(true);
         transaction.setRawResult("0x03");
         transaction.setRawTx("0x00");
@@ -290,7 +289,7 @@ class AlertMatchingCooldownRaceConditionTest {
         contractCall.setTransaction(transaction);
         contractCall.setContractIdentifier("SP2C2YFP12AJZB4MABJBAJ55XECVS7E4PMMZ89YZR.arkadiko-swap-v2-1");
         contractCall.setFunctionName("swap-x-for-y");
-        contractCall.setFunctionArgs("[]");
+        contractCall.setFunctionArgs(java.util.Collections.emptyMap());
 
         transaction.setContractCall(contractCall);
         transaction = stacksTransactionRepository.save(transaction);

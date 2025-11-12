@@ -67,7 +67,7 @@ class JwtSecurityIntegrationTest {
         user.setEmail("test@example.com");
         user.setPasswordHash("$2a$12$dummy");
         user.setFullName("Test User");
-        user.setIsActive(true);
+        user.setActive(true);
         userRepository.save(user);
 
         testUser = userDetailsService.loadUserByUsername("test@example.com");

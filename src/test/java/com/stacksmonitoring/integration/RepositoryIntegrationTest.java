@@ -78,7 +78,6 @@ class RepositoryIntegrationTest {
         tx.setSuccess(true);
         tx.setTxIndex(0);
         tx.setNonce(1L);
-        tx.setFeeRate(new BigDecimal("1000"));
         tx.setDeleted(false);
 
         block.addTransaction(tx);
@@ -135,7 +134,6 @@ class RepositoryIntegrationTest {
         tx.setSuccess(true);
         tx.setTxIndex(0);
         tx.setNonce(1L);
-        tx.setFeeRate(new BigDecimal("1000"));
         tx.setDeleted(false);
         return tx;
     }

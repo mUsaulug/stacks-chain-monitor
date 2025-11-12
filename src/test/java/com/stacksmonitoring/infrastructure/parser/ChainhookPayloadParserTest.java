@@ -19,10 +19,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ChainhookPayloadParserTest {
 
     private ChainhookPayloadParser parser;
+    private com.stacksmonitoring.infrastructure.mapper.ChainhookMapper chainhookMapper;
 
     @BeforeEach
     void setUp() {
-        parser = new ChainhookPayloadParser();
+        chainhookMapper = org.mapstruct.factory.Mappers.getMapper(com.stacksmonitoring.infrastructure.mapper.ChainhookMapper.class);
+        parser = new ChainhookPayloadParser(chainhookMapper);
     }
 
     @Test
@@ -458,7 +460,7 @@ class ChainhookPayloadParserTest {
         TransactionMetadataDto metadata = new TransactionMetadataDto();
         metadata.setSender(sender);
         metadata.setSuccess(success);
-        metadata.setFee(1000L);
+        metadata.setFee("1000");
 
         PositionDto position = new PositionDto();
         position.setIndex(0);
