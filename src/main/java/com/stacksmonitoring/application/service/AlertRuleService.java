@@ -54,8 +54,8 @@ public class AlertRuleService {
 
         AlertRule savedRule = alertRuleRepository.save(rule);
 
-        // Invalidate cache
-        alertMatchingService.invalidateRulesCache();
+        // Cache invalidation: RuleIndex rebuilds automatically on next access
+        // alertMatchingService.invalidateRulesCache();
 
         log.info("Created alert rule {} for user {}", savedRule.getId(), email);
 
@@ -136,8 +136,8 @@ public class AlertRuleService {
 
         AlertRule updatedRule = alertRuleRepository.save(rule);
 
-        // Invalidate cache
-        alertMatchingService.invalidateRulesCache();
+        // Cache invalidation: RuleIndex rebuilds automatically on next access
+        // alertMatchingService.invalidateRulesCache();
 
         log.info("Updated rule {} status to {}", ruleId, active);
 
@@ -151,8 +151,8 @@ public class AlertRuleService {
     public void deleteRule(Long ruleId) {
         alertRuleRepository.deleteById(ruleId);
 
-        // Invalidate cache
-        alertMatchingService.invalidateRulesCache();
+        // Cache invalidation: RuleIndex rebuilds automatically on next access
+        // alertMatchingService.invalidateRulesCache();
 
         log.info("Deleted alert rule {}", ruleId);
     }

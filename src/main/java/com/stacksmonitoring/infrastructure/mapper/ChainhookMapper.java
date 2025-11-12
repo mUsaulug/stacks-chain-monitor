@@ -186,14 +186,15 @@ public interface ChainhookMapper {
      */
     @Named("stringToTransactionType")
     default TransactionType stringToTransactionType(String type) {
-        if (type == null) return TransactionType.UNKNOWN;
+        if (type == null) return TransactionType.TOKEN_TRANSFER; // Default fallback
         return switch (type.toUpperCase()) {
             case "CONTRACTCALL" -> TransactionType.CONTRACT_CALL;
-            case "CONTRACTDEPLOYMENT" -> TransactionType.CONTRACT_DEPLOYMENT;
+            case "CONTRACTDEPLOYMENT", "SMARTCONTRACT" -> TransactionType.SMART_CONTRACT;
             case "TOKENTRANSFER" -> TransactionType.TOKEN_TRANSFER;
             case "COINBASE" -> TransactionType.COINBASE;
             case "POISONMICROBLOCK" -> TransactionType.POISON_MICROBLOCK;
-            default -> TransactionType.UNKNOWN;
+            case "TENURECHANGE" -> TransactionType.TENURE_CHANGE;
+            default -> TransactionType.TOKEN_TRANSFER; // Unknown types default to TOKEN_TRANSFER
         };
     }
 
