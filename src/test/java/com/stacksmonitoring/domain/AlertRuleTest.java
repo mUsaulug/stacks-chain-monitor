@@ -25,7 +25,7 @@ class AlertRuleTest {
         alertRule.setFunctionName("transfer");
         alertRule.setSeverity(AlertSeverity.WARNING);
         alertRule.setCooldownMinutes(60);
-        alertRule.setIsActive(true);
+        alertRule.setActive(true);
     }
 
     @Test

@@ -50,7 +50,7 @@ public class AlertRuleResponse {
         response.setDescription(rule.getDescription());
         response.setRuleType(rule.getRuleType());
         response.setSeverity(rule.getSeverity());
-        response.setIsActive(rule.getIsActive());
+        response.setIsActive(rule.isActive());
         response.setCooldownMinutes(rule.getCooldownMinutes());
         response.setLastTriggeredAt(rule.getLastTriggeredAt());
         response.setNotificationChannels(rule.getNotificationChannels());

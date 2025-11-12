@@ -68,7 +68,15 @@ public abstract class AlertRule {
     private AlertSeverity severity = AlertSeverity.INFO;
 
     @Column(name = "is_active", nullable = false)
-    private Boolean isActive = true;
+    private Boolean active = true;
+
+    /**
+     * Custom getter for active field to maintain isActive() naming convention.
+     * Lombok would generate getActive(), but we need isActive() for boolean fields.
+     */
+    public Boolean isActive() {
+        return active;
+    }
 
     /**
      * Cooldown period in minutes to prevent spam.
