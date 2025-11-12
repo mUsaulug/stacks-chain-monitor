@@ -4,6 +4,7 @@ import com.stacksmonitoring.infrastructure.config.RateLimitFilter;
 import io.github.bucket4j.Bucket;
 import io.github.bucket4j.BucketConfiguration;
 import io.github.bucket4j.distributed.proxy.ProxyManager;
+import io.github.bucket4j.distributed.proxy.RemoteBucketBuilder;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -44,6 +45,9 @@ class RateLimitFilterTest {
     @Mock
     private Bucket bucket;
 
+    @Mock
+    private RemoteBucketBuilder<String> bucketBuilder;
+
     @InjectMocks
     private RateLimitFilter rateLimitFilter;
 
@@ -55,9 +59,7 @@ class RateLimitFilterTest {
 
         when(request.getRemoteAddr()).thenReturn("127.0.0.1");
 
-        // Mock ProxyManager to return our mock bucket
-        @SuppressWarnings("unchecked")
-        ProxyManager.BucketBuilder<String> bucketBuilder = mock(ProxyManager.BucketBuilder.class);
+        // Mock ProxyManager to return our mock bucket (Bucket4j 8.x API)
         when(proxyManager.builder()).thenReturn(bucketBuilder);
         when(bucketBuilder.build(anyString(), any(Supplier.class))).thenReturn(bucket);
 
