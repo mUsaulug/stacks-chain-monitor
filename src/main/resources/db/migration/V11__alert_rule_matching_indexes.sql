@@ -31,9 +31,7 @@ CREATE INDEX IF NOT EXISTS idx_alert_rule_contract_type_active
 -- Faster than full index: no need to scan inactive rows
 
 COMMENT ON INDEX idx_alert_rule_contract_type_active IS
-    'Composite index for contract-based alert matching. ' ||
-    'Partial index (is_active=TRUE, contract_identifier NOT NULL) reduces size and improves performance. ' ||
-    'Used by ContractCallAlertRule, ContractDeployAlertRule.';
+    'Composite index for contract-based alert matching. Partial index (is_active=TRUE, contract_identifier NOT NULL) reduces size and improves performance. Used by ContractCallAlertRule, ContractDeployAlertRule.';
 
 -- ============================================================
 -- COMPOSITE INDEXES (asset-based rules)
@@ -47,9 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_alert_rule_asset_type_active
     WHERE is_active = TRUE AND asset_identifier IS NOT NULL;
 
 COMMENT ON INDEX idx_alert_rule_asset_type_active IS
-    'Composite index for asset-based alert matching (FT/NFT transfers). ' ||
-    'Partial index (is_active=TRUE, asset_identifier NOT NULL) for optimal performance. ' ||
-    'Used by TokenTransferAlertRule, NFTTransferAlertRule.';
+    'Composite index for asset-based alert matching (FT/NFT transfers). Partial index (is_active=TRUE, asset_identifier NOT NULL) for optimal performance. Used by TokenTransferAlertRule, NFTTransferAlertRule.';
 
 -- ============================================================
 -- COMPOSITE INDEXES (address-based rules)
@@ -63,9 +59,7 @@ CREATE INDEX IF NOT EXISTS idx_alert_rule_address_type_active
     WHERE is_active = TRUE AND watched_address IS NOT NULL;
 
 COMMENT ON INDEX idx_alert_rule_address_type_active IS
-    'Composite index for address-based alert matching. ' ||
-    'Partial index (is_active=TRUE, watched_address NOT NULL). ' ||
-    'Used by AddressActivityAlertRule.';
+    'Composite index for address-based alert matching. Partial index (is_active=TRUE, watched_address NOT NULL). Used by AddressActivityAlertRule.';
 
 -- ============================================================
 -- FALLBACK INDEX (type + active)
@@ -79,9 +73,7 @@ CREATE INDEX IF NOT EXISTS idx_alert_rule_type_active
     WHERE is_active = TRUE;
 
 COMMENT ON INDEX idx_alert_rule_type_active IS
-    'Fallback index for type-based rule matching. ' ||
-    'Used when no specific contract_identifier/asset_identifier filter. ' ||
-    'Covers FailedTransactionAlertRule, PrintEventAlertRule.';
+    'Fallback index for type-based rule matching. Used when no specific contract_identifier/asset_identifier filter. Covers FailedTransactionAlertRule, PrintEventAlertRule.';
 
 -- ============================================================
 -- USER-BASED INDEX (for user rule queries)
@@ -95,8 +87,7 @@ CREATE INDEX IF NOT EXISTS idx_alert_rule_user_active
     WHERE is_active = TRUE;
 
 COMMENT ON INDEX idx_alert_rule_user_active IS
-    'Index for fetching user''s active rules (dashboard queries). ' ||
-    'Includes created_at DESC for sorting without additional sort step.';
+    'Index for fetching user''s active rules (dashboard queries). Includes created_at DESC for sorting without additional sort step.';
 
 -- ============================================================
 -- PERFORMANCE NOTES
