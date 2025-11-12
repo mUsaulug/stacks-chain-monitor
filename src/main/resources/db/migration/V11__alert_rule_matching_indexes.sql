@@ -7,10 +7,10 @@
 -- PROBLEM STATEMENT
 -- ============================================================
 -- Alert matching queries filter by:
---   1. contract_id (for contract call rules)
---   2. asset_id (for token/NFT transfer rules)
---   3. type (rule type: CONTRACT_CALL, TOKEN_TRANSFER, etc.)
---   4. active (only active rules should match)
+--   1. contract_identifier (for contract call rules)
+--   2. asset_identifier (for token/NFT transfer rules)
+--   3. rule_type (rule type: CONTRACT_CALL, TOKEN_TRANSFER, etc.)
+--   4. is_active (only active rules should match)
 --
 -- Without indexes: Full table scan (50ms for 1000 rules → 5s for 100K rules)
 -- With composite indexes: Index scan (<1ms for any rule count)
@@ -21,18 +21,18 @@
 
 -- Index 1: Contract-based rule matching
 -- Used by: ContractCallAlertRule, ContractDeployAlertRule
--- Query pattern: WHERE contract_id = ? AND type = ? AND active = TRUE
+-- Query pattern: WHERE contract_identifier = ? AND type = ? AND is_active = TRUE
 CREATE INDEX IF NOT EXISTS idx_alert_rule_contract_type_active
-    ON alert_rule (contract_id, type, active)
-    WHERE active = TRUE AND contract_id IS NOT NULL;
+    ON alert_rule (contract_identifier, rule_type, is_active)
+    WHERE is_active = TRUE AND contract_identifier IS NOT NULL;
 
--- Partial index: Only active rules with contract_id
+-- Partial index: Only active rules with contract_identifier
 -- Reduces index size by ~50% (inactive rules excluded)
 -- Faster than full index: no need to scan inactive rows
 
 COMMENT ON INDEX idx_alert_rule_contract_type_active IS
     'Composite index for contract-based alert matching. ' ||
-    'Partial index (active=TRUE, contract_id NOT NULL) reduces size and improves performance. ' ||
+    'Partial index (is_active=TRUE, contract_identifier NOT NULL) reduces size and improves performance. ' ||
     'Used by ContractCallAlertRule, ContractDeployAlertRule.';
 
 -- ============================================================
@@ -41,14 +41,14 @@ COMMENT ON INDEX idx_alert_rule_contract_type_active IS
 
 -- Index 2: Asset-based rule matching
 -- Used by: TokenTransferAlertRule, NFTTransferAlertRule
--- Query pattern: WHERE asset_id = ? AND type = ? AND active = TRUE
+-- Query pattern: WHERE asset_identifier = ? AND type = ? AND is_active = TRUE
 CREATE INDEX IF NOT EXISTS idx_alert_rule_asset_type_active
-    ON alert_rule (asset_id, type, active)
-    WHERE active = TRUE AND asset_id IS NOT NULL;
+    ON alert_rule (asset_identifier, rule_type, is_active)
+    WHERE is_active = TRUE AND asset_identifier IS NOT NULL;
 
 COMMENT ON INDEX idx_alert_rule_asset_type_active IS
     'Composite index for asset-based alert matching (FT/NFT transfers). ' ||
-    'Partial index (active=TRUE, asset_id NOT NULL) for optimal performance. ' ||
+    'Partial index (is_active=TRUE, asset_identifier NOT NULL) for optimal performance. ' ||
     'Used by TokenTransferAlertRule, NFTTransferAlertRule.';
 
 -- ============================================================
@@ -57,14 +57,14 @@ COMMENT ON INDEX idx_alert_rule_asset_type_active IS
 
 -- Index 3: Address activity rule matching
 -- Used by: AddressActivityAlertRule
--- Query pattern: WHERE monitored_address = ? AND type = ? AND active = TRUE
+-- Query pattern: WHERE watched_address = ? AND type = ? AND is_active = TRUE
 CREATE INDEX IF NOT EXISTS idx_alert_rule_address_type_active
-    ON alert_rule (monitored_address, type, active)
-    WHERE active = TRUE AND monitored_address IS NOT NULL;
+    ON alert_rule (watched_address, rule_type, is_active)
+    WHERE is_active = TRUE AND watched_address IS NOT NULL;
 
 COMMENT ON INDEX idx_alert_rule_address_type_active IS
     'Composite index for address-based alert matching. ' ||
-    'Partial index (active=TRUE, monitored_address NOT NULL). ' ||
+    'Partial index (is_active=TRUE, watched_address NOT NULL). ' ||
     'Used by AddressActivityAlertRule.';
 
 -- ============================================================
@@ -73,14 +73,14 @@ COMMENT ON INDEX idx_alert_rule_address_type_active IS
 
 -- Index 4: Type-based fallback (for rules without specific filters)
 -- Used by: FailedTransactionAlertRule, PrintEventAlertRule (no specific contract/asset)
--- Query pattern: WHERE type = ? AND active = TRUE
+-- Query pattern: WHERE rule_type = ? AND is_active = TRUE
 CREATE INDEX IF NOT EXISTS idx_alert_rule_type_active
-    ON alert_rule (type, active)
-    WHERE active = TRUE;
+    ON alert_rule (rule_type, is_active)
+    WHERE is_active = TRUE;
 
 COMMENT ON INDEX idx_alert_rule_type_active IS
     'Fallback index for type-based rule matching. ' ||
-    'Used when no specific contract_id/asset_id filter. ' ||
+    'Used when no specific contract_identifier/asset_identifier filter. ' ||
     'Covers FailedTransactionAlertRule, PrintEventAlertRule.';
 
 -- ============================================================
@@ -89,10 +89,10 @@ COMMENT ON INDEX idx_alert_rule_type_active IS
 
 -- Index 5: User's active rules
 -- Used by: Admin dashboard, rule management API
--- Query pattern: WHERE user_id = ? AND active = TRUE ORDER BY created_at DESC
+-- Query pattern: WHERE user_id = ? AND is_active = TRUE ORDER BY created_at DESC
 CREATE INDEX IF NOT EXISTS idx_alert_rule_user_active
-    ON alert_rule (user_id, active, created_at DESC)
-    WHERE active = TRUE;
+    ON alert_rule (user_id, is_active, created_at DESC)
+    WHERE is_active = TRUE;
 
 COMMENT ON INDEX idx_alert_rule_user_active IS
     'Index for fetching user''s active rules (dashboard queries). ' ||
@@ -103,12 +103,12 @@ COMMENT ON INDEX idx_alert_rule_user_active IS
 -- ============================================================
 
 -- BEFORE (without indexes):
--- Query: SELECT * FROM alert_rule WHERE contract_id = 'SP2ABC...' AND active = TRUE
+-- Query: SELECT * FROM alert_rule WHERE contract_identifier = 'SP2ABC...' AND is_active = TRUE
 -- Plan: Seq Scan on alert_rule (cost=0.00..1247.00 rows=5000 width=...)
 -- Time: 45.2 ms (1000 rules), 500 ms (10K rules), 5 seconds (100K rules)
 
 -- AFTER (with idx_alert_rule_contract_type_active):
--- Query: SELECT * FROM alert_rule WHERE contract_id = 'SP2ABC...' AND type = 'CONTRACT_CALL' AND active = TRUE
+-- Query: SELECT * FROM alert_rule WHERE contract_identifier = 'SP2ABC...' AND rule_type = 'CONTRACT_CALL' AND is_active = TRUE
 -- Plan: Index Scan using idx_alert_rule_contract_type_active (cost=0.42..8.44 rows=1 width=...)
 -- Time: 0.8 ms (any rule count) ← 60x faster!
 
