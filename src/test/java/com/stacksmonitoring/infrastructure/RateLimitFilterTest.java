@@ -3,6 +3,7 @@ package com.stacksmonitoring.infrastructure;
 import com.stacksmonitoring.infrastructure.config.RateLimitFilter;
 import io.github.bucket4j.Bucket;
 import io.github.bucket4j.BucketConfiguration;
+import io.github.bucket4j.distributed.BucketProxy;
 import io.github.bucket4j.distributed.proxy.ProxyManager;
 import io.github.bucket4j.distributed.proxy.RemoteBucketBuilder;
 import jakarta.servlet.FilterChain;
@@ -43,7 +44,7 @@ class RateLimitFilterTest {
     private FilterChain filterChain;
 
     @Mock
-    private Bucket bucket;
+    private BucketProxy bucket;
 
     @Mock
     private RemoteBucketBuilder<String> bucketBuilder;
