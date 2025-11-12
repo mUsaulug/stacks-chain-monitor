@@ -164,6 +164,7 @@ class AlertMatchingServiceTest {
 
         FailedTransactionAlertRule rule = new FailedTransactionAlertRule();
         rule.setId(1L);
+        rule.setRuleType(AlertRuleType.FAILED_TRANSACTION);
         rule.setSeverity(AlertSeverity.HIGH);
         rule.setNotificationChannels(List.of(NotificationChannel.EMAIL));
         rule.setRuleName("Failed Transaction Alert");
@@ -293,6 +294,7 @@ class AlertMatchingServiceTest {
     private ContractCallAlertRule createContractCallRule() {
         ContractCallAlertRule rule = new ContractCallAlertRule();
         rule.setId(1L);
+        rule.setRuleType(AlertRuleType.CONTRACT_CALL);
         rule.setContractIdentifier("SP123.my-contract");
         rule.setFunctionName("transfer");
         rule.setSeverity(AlertSeverity.MEDIUM);
@@ -305,6 +307,7 @@ class AlertMatchingServiceTest {
     private TokenTransferAlertRule createTokenTransferRule() {
         TokenTransferAlertRule rule = new TokenTransferAlertRule();
         rule.setId(2L);
+        rule.setRuleType(AlertRuleType.TOKEN_TRANSFER);
         rule.setAssetIdentifier("SP123.token::my-token");
         rule.setEventType(EventType.FT_TRANSFER);
         rule.setSeverity(AlertSeverity.LOW);
