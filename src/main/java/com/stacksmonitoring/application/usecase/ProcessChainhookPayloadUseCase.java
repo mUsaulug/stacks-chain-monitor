@@ -11,6 +11,8 @@ import com.stacksmonitoring.domain.model.monitoring.AlertNotification;
 import com.stacksmonitoring.domain.repository.StacksBlockRepository;
 import com.stacksmonitoring.domain.repository.StacksTransactionRepository;
 import com.stacksmonitoring.infrastructure.parser.ChainhookPayloadParser;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
@@ -41,7 +43,10 @@ import java.util.Optional;
  * - Webhook re-delivery returns 200 OK without creating duplicates
  * - Reference: stacks-monitoring-derin-analiz-ozet.txt
  *
- * Reference: CLAUDE.md P0-6 (AFTER_COMMIT Notification Dispatch)
+ * Observability (P1 - Micrometer):
+ * - rollback.notifications.invalidated: Counter for invalidated notifications during rollbacks
+ *
+ * Reference: CLAUDE.md P0-6 (AFTER_COMMIT Notification Dispatch), P2-5 (Metrics)
  */
 @Service
 @RequiredArgsConstructor
@@ -54,6 +59,7 @@ public class ProcessChainhookPayloadUseCase {
     private final AlertMatchingService alertMatchingService;
     private final ApplicationEventPublisher eventPublisher;
     private final com.stacksmonitoring.domain.repository.AlertNotificationRepository alertNotificationRepository;
+    private final MeterRegistry meterRegistry;
 
     /**
      * Process a complete Chainhook webhook payload.
@@ -161,6 +167,15 @@ public class ProcessChainhookPayloadUseCase {
             );
 
             totalInvalidatedNotifications += invalidatedCount;
+
+            // P1 Metric: Track invalidated notifications for observability
+            if (invalidatedCount > 0) {
+                Counter.builder("rollback.notifications.invalidated")
+                        .description("Total notifications invalidated due to blockchain rollbacks")
+                        .tag("reason", "BLOCKCHAIN_REORG")
+                        .register(meterRegistry)
+                        .increment(invalidatedCount);
+            }
 
             // Persist block with cascaded soft deletes
             blockRepository.save(block);

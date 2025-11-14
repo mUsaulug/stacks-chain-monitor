@@ -12,6 +12,8 @@ import com.stacksmonitoring.domain.repository.AlertNotificationRepository;
 import com.stacksmonitoring.domain.repository.AlertRuleRepository;
 import com.stacksmonitoring.domain.valueobject.AlertRuleType;
 import com.stacksmonitoring.domain.valueobject.NotificationChannel;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
@@ -35,7 +37,10 @@ import java.util.stream.Collectors;
  * - Multi-level index (contract + function + asset)
  * - O(1) candidate lookup (vs O(k) full scan)
  *
- * Reference: CLAUDE.md P1-1, P1-3
+ * Observability (P1 - Micrometer):
+ * - alert.matching.duration: Timer for transaction evaluation performance
+ *
+ * Reference: CLAUDE.md P1-1, P1-3, P2-5
  */
 @Service
 @RequiredArgsConstructor
@@ -44,16 +49,33 @@ public class AlertMatchingService {
 
     private final AlertRuleRepository alertRuleRepository;
     private final AlertNotificationRepository alertNotificationRepository;
+    private final MeterRegistry meterRegistry;
 
     /**
      * Evaluate all alert rules against a transaction.
      * Creates notifications for matched rules.
+     *
+     * Metrics: Tracks alert.matching.duration timer for performance monitoring.
      *
      * @param transaction The transaction to evaluate
      * @return List of created alert notifications
      */
     @Transactional
     public List<AlertNotification> evaluateTransaction(StacksTransaction transaction) {
+        // P1 Metric: Track alert matching duration for performance monitoring
+        return Timer.builder("alert.matching.duration")
+                .description("Time taken to evaluate all alert rules against a transaction")
+                .tag("tx_type", transaction.getTxType().name())
+                .tag("has_contract_call", String.valueOf(transaction.getContractCall() != null))
+                .tag("event_count", String.valueOf(transaction.getEvents() != null ? transaction.getEvents().size() : 0))
+                .register(meterRegistry)
+                .record(() -> evaluateTransactionInternal(transaction));
+    }
+
+    /**
+     * Internal implementation of transaction evaluation (wrapped by metrics timer).
+     */
+    private List<AlertNotification> evaluateTransactionInternal(StacksTransaction transaction) {
         List<AlertNotification> notifications = new ArrayList<>();
 
         // Evaluate contract call alerts

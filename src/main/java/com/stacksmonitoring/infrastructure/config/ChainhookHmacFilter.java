@@ -2,6 +2,7 @@ package com.stacksmonitoring.infrastructure.config;
 
 import com.stacksmonitoring.application.service.WebhookArchivalService;
 import com.stacksmonitoring.domain.model.webhook.RawWebhookEvent;
+import jakarta.annotation.PostConstruct;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -80,6 +81,44 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
 
     @Autowired(required = false)
     private StringRedisTemplate redisTemplate;
+
+    /**
+     * Validate HMAC secret on application startup (P1 - Security).
+     * Prevents deploying with weak or default secrets.
+     */
+    @PostConstruct
+    public void validateHmacSecret() {
+        if (!webhookEnabled) {
+            log.info("Webhook validation disabled - skipping HMAC secret validation");
+            return;
+        }
+
+        if (hmacSecret == null || hmacSecret.isBlank()) {
+            throw new IllegalStateException(
+                "CHAINHOOK_HMAC_SECRET must be configured when webhooks are enabled. " +
+                "Set environment variable CHAINHOOK_HMAC_SECRET to a strong random value."
+            );
+        }
+
+        // Check for weak default values that should never be used in production
+        String secretLower = hmacSecret.toLowerCase();
+        if (secretLower.equals("change-me-in-production") ||
+            secretLower.equals("test-secret") ||
+            secretLower.equals("secret") ||
+            secretLower.equals("password") ||
+            secretLower.equals("default") ||
+            secretLower.length() < 32) {
+
+            throw new IllegalStateException(
+                "CHAINHOOK_HMAC_SECRET is weak or uses a default value. " +
+                "Current value: '" + hmacSecret + "' (length: " + hmacSecret.length() + "). " +
+                "REQUIRED: Strong random secret with at least 32 characters. " +
+                "Generate with: openssl rand -hex 32"
+            );
+        }
+
+        log.info("HMAC secret validation passed (length: {} chars)", hmacSecret.length());
+    }
 
     @Override
     protected void doFilterInternal(

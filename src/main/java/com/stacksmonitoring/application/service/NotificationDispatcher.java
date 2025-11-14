@@ -4,6 +4,8 @@ import com.stacksmonitoring.application.event.NotificationsReadyEvent;
 import com.stacksmonitoring.domain.model.monitoring.AlertNotification;
 import com.stacksmonitoring.domain.repository.AlertNotificationRepository;
 import com.stacksmonitoring.domain.valueobject.NotificationStatus;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Async;
@@ -30,7 +32,10 @@ import java.util.List;
  * 3. If commit succeeds → handleNotificationsReady() called → notifications sent
  * 4. If commit fails/rollback → event listener never called → no phantom notifications
  *
- * Reference: CLAUDE.md P0-6 (AFTER_COMMIT Notification Dispatch)
+ * Observability (P1 - Micrometer):
+ * - notification.dispatched: Counter for each dispatch attempt (tagged by channel and status)
+ *
+ * Reference: CLAUDE.md P0-6 (AFTER_COMMIT Notification Dispatch), P2-5 (Metrics)
  * Spring Docs: https://docs.spring.io/spring-framework/reference/data-access/transaction/event.html
  */
 @Service
@@ -40,15 +45,20 @@ public class NotificationDispatcher {
 
     private final List<NotificationService> notificationServices;
     private final AlertNotificationRepository alertNotificationRepository;
+    private final MeterRegistry meterRegistry;
 
     /**
      * Dispatch a single notification to the appropriate service.
+     *
+     * Metrics: Increments notification.dispatched counter tagged by channel and status.
      */
     @Async
     @Transactional
     public void dispatch(AlertNotification notification) {
         log.debug("Dispatching notification {} via channel {}",
             notification.getId(), notification.getChannel());
+
+        String channel = notification.getChannel().name();
 
         // Find supporting service
         NotificationService service = notificationServices.stream()
@@ -61,6 +71,9 @@ public class NotificationDispatcher {
                 notification.getChannel());
             notification.markAsFailed("No service supports channel: " + notification.getChannel());
             alertNotificationRepository.save(notification);
+
+            // P1 Metric: Track failed dispatch (no service found)
+            incrementNotificationCounter(channel, "no_service");
             return;
         }
 
@@ -75,13 +88,31 @@ public class NotificationDispatcher {
             log.info("Successfully sent notification {} via {}",
                 notification.getId(), notification.getChannel());
 
+            // P1 Metric: Track successful dispatch
+            incrementNotificationCounter(channel, "success");
+
         } catch (NotificationService.NotificationException e) {
             log.error("Failed to send notification {}: {}",
                 notification.getId(), e.getMessage());
 
             notification.markAsFailed(e.getMessage());
             alertNotificationRepository.save(notification);
+
+            // P1 Metric: Track failed dispatch
+            incrementNotificationCounter(channel, "failure");
         }
+    }
+
+    /**
+     * Increment notification.dispatched counter with channel and status tags.
+     */
+    private void incrementNotificationCounter(String channel, String status) {
+        Counter.builder("notification.dispatched")
+                .description("Total notifications dispatched by channel and status")
+                .tag("channel", channel)
+                .tag("status", status)
+                .register(meterRegistry)
+                .increment();
     }
 
     /**
