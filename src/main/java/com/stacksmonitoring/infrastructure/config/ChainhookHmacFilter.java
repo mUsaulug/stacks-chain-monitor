@@ -9,10 +9,13 @@ import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.lang.NonNull;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.util.ContentCachingRequestWrapper;
+
+import java.time.Duration;
 
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
@@ -37,11 +40,17 @@ import java.util.HexFormat;
  * - HMAC includes timestamp: hmac(secret, timestamp + "." + body)
  * - Constant-time comparison: Prevent timing attacks
  *
- * Replay Attack Prevention:
+ * Replay Attack Prevention (P0-4):
  * 1. Client includes X-Signature-Timestamp header (Unix seconds)
- * 2. Filter rejects requests outside 5-minute window
- * 3. HMAC calculated as: hmac(secret, timestamp + "." + body)
- * 4. Future enhancement: Nonce tracking with Redis (P0-2)
+ * 2. Client includes X-Nonce header (unique request ID)
+ * 3. Filter rejects requests outside 5-minute window
+ * 4. Filter rejects nonce reuse via Redis SETNX (atomic check-and-set)
+ * 5. HMAC calculated as: hmac(secret, timestamp + "." + body)
+ *
+ * Redis Nonce Tracking:
+ * - Key format: webhook:nonce:{nonce}
+ * - TTL: MAX_TIMESTAMP_SKEW_SECONDS (5 minutes)
+ * - Atomic operation: SETNX prevents concurrent replay
  *
  * Reference: CLAUDE.md P0-4 (HMAC Replay Protection), A.2 (Webhook Archival)
  */
@@ -52,8 +61,10 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
     private static final String HMAC_ALGORITHM = "HmacSHA256";
     private static final String SIGNATURE_HEADER = "X-Signature";
     private static final String TIMESTAMP_HEADER = "X-Signature-Timestamp";
+    private static final String NONCE_HEADER = "X-Nonce";
     private static final long MAX_TIMESTAMP_SKEW_SECONDS = 300; // 5 minutes
     private static final String WEBHOOK_ID_ATTRIBUTE = "webhookEventId";
+    private static final String NONCE_REDIS_KEY_PREFIX = "webhook:nonce:";
 
     @Value("${stacks.monitoring.webhook.hmac-secret}")
     private String hmacSecret;
@@ -66,6 +77,9 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
 
     @Autowired(required = false)
     private WebhookArchivalService webhookArchivalService;
+
+    @Autowired(required = false)
+    private StringRedisTemplate redisTemplate;
 
     @Override
     protected void doFilterInternal(
@@ -155,6 +169,37 @@ public class ChainhookHmacFilter extends OncePerRequestFilter {
                     response.sendError(HttpServletResponse.SC_UNAUTHORIZED,
                             "Request timestamp outside acceptable window");
                     return;
+                }
+
+                // Nonce validation (prevent replay attacks within timestamp window)
+                String nonce = wrappedRequest.getHeader(NONCE_HEADER);
+                if (nonce == null || nonce.isEmpty()) {
+                    log.warn("Chainhook webhook rejected: Missing {} header", NONCE_HEADER);
+                    markAsRejected(webhookEventId, "Missing nonce header");
+                    response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Missing nonce header");
+                    return;
+                }
+
+                // Check nonce uniqueness via Redis (atomic SETNX with TTL)
+                // If nonce already exists, this is a replay attack
+                if (redisTemplate != null) {
+                    String nonceKey = NONCE_REDIS_KEY_PREFIX + nonce;
+                    Boolean wasAbsent = redisTemplate.opsForValue().setIfAbsent(
+                        nonceKey,
+                        "1",
+                        Duration.ofSeconds(MAX_TIMESTAMP_SKEW_SECONDS)
+                    );
+
+                    if (!Boolean.TRUE.equals(wasAbsent)) {
+                        log.warn("Chainhook webhook rejected: Nonce {} already used (replay attack detected)", nonce);
+                        markAsRejected(webhookEventId, "Nonce replay attack detected: " + nonce);
+                        response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Nonce already used");
+                        return;
+                    }
+
+                    log.debug("Nonce {} accepted and stored in Redis with TTL {}s", nonce, MAX_TIMESTAMP_SKEW_SECONDS);
+                } else {
+                    log.warn("Redis not available - nonce validation skipped (replay attacks possible!)");
                 }
             }
 

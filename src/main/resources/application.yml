@@ -99,6 +99,7 @@ spring:
           writetimeout: 5000
 
   # Actuator Configuration
+  # P0-SEC-4: Only health and info are public, prometheus/metrics require ADMIN role
   management:
     endpoints:
       web:

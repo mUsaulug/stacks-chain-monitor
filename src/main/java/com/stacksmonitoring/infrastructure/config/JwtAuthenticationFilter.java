@@ -69,10 +69,15 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
             }
 
             // CRITICAL: Validate fingerprint (sidejacking prevention)
+            // P0-SEC-2: Fingerprint cookie is MANDATORY - reject if missing or invalid
             String fingerprintCookie = extractFingerprintCookie(request);
-            if (fingerprintCookie != null && !jwtTokenService.validateFingerprint(jwt, fingerprintCookie)) {
-                log.warn("Fingerprint mismatch for user: {} - potential token sidejacking", userEmail);
-                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid token fingerprint");
+            if (fingerprintCookie == null || !jwtTokenService.validateFingerprint(jwt, fingerprintCookie)) {
+                if (fingerprintCookie == null) {
+                    log.warn("Missing fingerprint cookie for user: {} - potential token sidejacking", userEmail);
+                } else {
+                    log.warn("Fingerprint mismatch for user: {} - potential token sidejacking", userEmail);
+                }
+                response.sendError(HttpServletResponse.SC_UNAUTHORIZED, "Invalid or missing token fingerprint");
                 return;
             }
 

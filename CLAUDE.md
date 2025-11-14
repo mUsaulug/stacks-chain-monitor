@@ -53,12 +53,12 @@
 │    ProcessChainhookPayloadUseCase.java:63                           │
 │    - handleRollbacks(): Soft delete + bulk invalidation ✅         │
 │    - handleApplies(): Parse + persist with idempotent upsert ✅    │
-│    - Alert matching via RuleIndexService ✅                        │
+│    - Alert matching via AlertMatchingService ✅                        │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 5. Alert Matching (O(1) Index-Based) ✅                            │
-│    RuleIndexService.java                                            │
+│    AlertMatchingService.java                                            │
 │    - Immutable RuleSnapshot DTOs (not entities)                     │
 │    - Multi-level index: contractAddress → rules, assetId → rules   │
 └─────────────────────────────────────────────────────────────────────┘
@@ -75,17 +75,19 @@
 
 | Component | File Path | Status | Notes |
 |-----------|-----------|--------|-------|
-| HMAC Filter | `src/main/java/com/stacksmonitoring/infrastructure/security/ChainhookHmacFilter.java` | ✅ Fixed | Timestamp + nonce validation |
-| JWT Filter | `src/main/java/com/stacksmonitoring/infrastructure/security/JwtAuthenticationFilter.java` | ◑ Partial | Revocation + fingerprint ✅, RS256 ⛔ |
-| Rate Limiter | `src/main/java/com/stacksmonitoring/infrastructure/security/RateLimitFilter.java` | ✅ Fixed | Redis-backed distributed |
-| Security Config | `src/main/java/com/stacksmonitoring/infrastructure/config/SecurityConfiguration.java` | ✅ Fixed | Correct filter order + actuator lockdown |
-| Webhook Archival | `src/main/java/com/stacksmonitoring/application/service/WebhookArchivalService.java` | ✅ New | Event sourcing (V8) |
-| Payload UseCase | `src/main/java/com/stacksmonitoring/application/usecase/ProcessChainhookPayloadUseCase.java` | ✅ Enhanced | Rollback invalidation (V9) |
-| Rule Index | `src/main/java/com/stacksmonitoring/application/service/RuleIndexService.java` | ✅ New | O(1) alert matching |
-| Notification Repo | `src/main/java/com/stacksmonitoring/domain/repository/AlertNotificationRepository.java` | ✅ Enhanced | Bulk invalidation query |
-| DLQ Service | `src/main/java/com/stacksmonitoring/application/service/DeadLetterQueueService.java` | ✅ New | Failed notification management (V10) |
-| Exception Handler | `src/main/java/com/stacksmonitoring/api/exception/GlobalExceptionHandler.java` | ✅ Complete | Production-ready error handling |
-| MDC Context | `src/main/java/com/stacksmonitoring/infrastructure/logging/MdcContextHolder.java` | ✅ Complete | Structured logging context |
+| HMAC Filter | `src/main/java/com/stacksmonitoring/infrastructure/config/ChainhookHmacFilter.java` | ✅ Complete | Timestamp + Redis nonce validation (P0-4) |
+| JWT Filter | `src/main/java/com/stacksmonitoring/infrastructure/config/JwtAuthenticationFilter.java` | ✅ Complete | RS256 + mandatory fingerprint + revocation (P0-SEC-2) |
+| JWT Token Service | `src/main/java/com/stacksmonitoring/infrastructure/config/JwtTokenService.java` | ✅ Complete | RSA 4096 + startup validation (P0-SEC-3) |
+| Rate Limiter | `src/main/java/com/stacksmonitoring/infrastructure/config/RateLimitFilter.java` | ✅ Complete | Redis-backed distributed (P0-2) |
+| Correlation ID Filter | `src/main/java/com/stacksmonitoring/infrastructure/logging/CorrelationIdFilter.java` | ✅ Complete | Request tracing with UUID (OBS-2) |
+| Security Config | `src/main/java/com/stacksmonitoring/infrastructure/config/SecurityConfiguration.java` | ✅ Complete | Correct filter order + actuator lockdown (P0-3, P0-5) |
+| Webhook Archival | `src/main/java/com/stacksmonitoring/application/service/WebhookArchivalService.java` | ✅ Complete | Event sourcing (V8) |
+| Payload UseCase | `src/main/java/com/stacksmonitoring/application/usecase/ProcessChainhookPayloadUseCase.java` | ✅ Complete | Rollback invalidation (V9) |
+| Alert Matching | `src/main/java/com/stacksmonitoring/application/service/AlertMatchingService.java` | ✅ Complete | O(1) matching with RuleIndex (P1-3) |
+| Notification Repo | `src/main/java/com/stacksmonitoring/domain/repository/AlertNotificationRepository.java` | ✅ Complete | Bulk invalidation query (V9) |
+| DLQ Service | `src/main/java/com/stacksmonitoring/application/service/DeadLetterQueueService.java` | ✅ Complete | Failed notification management (V10) |
+| Exception Handler | `src/main/java/com/stacksmonitoring/api/exception/GlobalExceptionHandler.java` | ✅ Complete | Production-ready error handling (P2-7) |
+| MDC Context | `src/main/java/com/stacksmonitoring/infrastructure/logging/MdcContextHolder.java` | ✅ Complete | Structured logging context (P2-6) |
 
 ---
 
@@ -534,6 +536,152 @@ WHERE contract_identifier = 'SP2ABC...'
 
 ---
 
+#### P0-4: HMAC Nonce Replay Protection ✅ COMPLETED
+
+**Implementation:** Redis-backed nonce tracking with atomic SETNX operations
+
+**Key Features:**
+- Client must send `X-Nonce` header (unique request identifier, e.g., UUID)
+- Server checks nonce uniqueness via Redis `setIfAbsent()` with TTL
+- Nonce stored with key format: `webhook:nonce:{nonce}`
+- TTL matches timestamp window: 300 seconds (5 minutes)
+- Atomic operation prevents race conditions in distributed deployments
+- Graceful degradation: If Redis unavailable, logs warning but continues (timestamp protection remains)
+
+**Attack Prevention:**
+- **Without nonce:** Attacker replays valid webhook within 5-minute window → duplicate processing
+- **With nonce:** Second replay attempt fails with 401 (nonce already exists in Redis)
+
+**Files Modified:**
+- `ChainhookHmacFilter.java` - Added nonce validation after timestamp check (lines 174-203)
+- Redis `StringRedisTemplate` injected for SETNX operations
+
+**Test Coverage Needed:**
+- [ ] Missing nonce header → 401
+- [ ] First nonce use → 200 OK + stored in Redis
+- [ ] Duplicate nonce within TTL → 401
+- [ ] Nonce expired (> 5 min) → new request with same nonce → 200 OK
+
+**References:**
+- OWASP API Security Top 10: A4:2023 Unrestricted Resource Consumption
+- Redis SETNX: https://redis.io/commands/setnx/
+
+---
+
+#### P0-SEC-2: JWT Fingerprint Enforcement ✅ COMPLETED
+
+**Change:** Fingerprint cookie is now **MANDATORY** (not optional)
+
+**Before:**
+```java
+if (fingerprintCookie != null && !validateFingerprint()) { reject(); }
+// If cookie missing, validation skipped → token sidejacking possible
+```
+
+**After:**
+```java
+if (fingerprintCookie == null || !validateFingerprint()) { reject(); }
+// Missing OR invalid cookie → 401 (strict enforcement)
+```
+
+**Security Impact:**
+- Prevents token sidejacking attacks where attacker steals JWT but not HttpOnly cookie
+- Example: XSS reads `localStorage` JWT but cannot access HttpOnly cookie
+- Enforces token-to-browser binding via fingerprint hash comparison
+
+**Files Modified:**
+- `JwtAuthenticationFilter.java` (lines 72-82) - Changed validation logic to reject null cookie
+
+**Logging:**
+- Missing cookie: `"Missing fingerprint cookie for user: {user} - potential token sidejacking"`
+- Invalid cookie: `"Fingerprint mismatch for user: {user} - potential token sidejacking"`
+
+---
+
+#### P0-SEC-3: RSA Key Startup Validation ✅ COMPLETED
+
+**Problem:** Application fails silently or with cryptic error if RSA keys missing
+
+**Solution:** Enhanced error handling in `JwtTokenService.init()` with clear deployment instructions
+
+**Features:**
+- Logs key file paths on startup for verification
+- Catches key loading failures and wraps with detailed error message
+- Provides actionable fix: run `scripts/generate-rsa-keys.sh` or set environment variables
+- Application fails fast with `IllegalStateException` if keys unavailable
+
+**Files Modified:**
+- `JwtTokenService.java` (lines 65-84) - Enhanced `@PostConstruct` with try-catch and detailed logging
+- `src/main/resources/keys/.gitkeep` (NEW) - Ensures directory exists in git without committing keys
+
+**Error Message Example:**
+```
+CRITICAL: Failed to load RSA keys. Application cannot start without valid JWT keys.
+Please ensure RSA key files exist at the configured paths:
+  - Private key: file:./keys/jwt-private-key.pem
+  - Public key: file:./keys/jwt-public-key.pem
+To generate keys, run: scripts/generate-rsa-keys.sh
+Or set environment variables JWT_PRIVATE_KEY_PATH and JWT_PUBLIC_KEY_PATH
+```
+
+**Deployment Guide:** See `scripts/generate-rsa-keys.sh` for key generation instructions
+
+---
+
+#### OBS-2: Request Correlation ID Filter ✅ COMPLETED
+
+**Implementation:** `CorrelationIdFilter` - Generates unique request ID for distributed tracing
+
+**Features:**
+- Runs at `HIGHEST_PRECEDENCE` (before all other filters)
+- Generates UUID for each request or extracts from `X-Request-ID` header
+- Stores in MDC with key `request_id`
+- Adds `X-Request-ID` response header for client-side correlation
+- Clears MDC after request to prevent thread pool memory leaks
+
+**Integration:**
+- Logback pattern: `%X{request_id}` → e.g., `[abc-123-def]`
+- JSON logging: Automatically included via LogstashEncoder's `includeMdc: true`
+- GlobalExceptionHandler: Uses `MDC.get("request_id")` in error responses
+
+**Files Created:**
+- `CorrelationIdFilter.java` (NEW) - OncePerRequestFilter with UUID generation
+
+**Usage in Logs:**
+```json
+{
+  "timestamp": "2025-11-14T22:00:00.000Z",
+  "level": "INFO",
+  "logger": "ProcessChainhookPayloadUseCase",
+  "message": "Processing block 0x123...",
+  "request_id": "abc-123-def-456",
+  "block_hash": "0x123..."
+}
+```
+
+---
+
+#### P0-SEC-4: Actuator Endpoint Clarification ✅ COMPLETED
+
+**Configuration Alignment:**
+
+**Public Endpoints** (no authentication required):
+- `/actuator/health` - Basic health check (UP/DOWN)
+- `/actuator/info` - Application metadata
+
+**Protected Endpoints** (require `ROLE_ADMIN`):
+- `/actuator/prometheus` - Prometheus metrics scraping
+- `/actuator/metrics` - Micrometer metrics JSON
+
+**Implementation:**
+- `application.yml` line 106: Exposes `health,info,prometheus,metrics`
+- `SecurityConfiguration.java` line 61: `.requestMatchers("/actuator/**").hasRole("ADMIN")`
+- Result: Prometheus/metrics return 401 for unauthenticated requests ✅
+
+**Clarification:** All actuator endpoints are exposed to Spring Boot actuator subsystem, but Spring Security filters control access. Only health/info bypass authentication via explicit `permitAll()` on lines 54-59.
+
+---
+
 ## Open Issues (Prioritized)
 
 ### P0: Production Blockers
@@ -555,7 +703,7 @@ All production-blocking security issues have been successfully completed:
 All P1 performance issues have been resolved ✅:
 - ✅ P1-1: Immutable DTO caching (RuleSnapshot)
 - ✅ P1-2: SEQUENCE migration (V5)
-- ✅ P1-3: O(1) alert matching (RuleIndexService)
+- ✅ P1-3: O(1) alert matching (AlertMatchingService)
 - ✅ P1-4: Atomic cooldown UPDATE
 - ✅ P1-5: Idempotency constraints (V7)
 - ✅ P1-6: Complete soft delete propagation (V4)
@@ -775,7 +923,7 @@ public class ErrorResponse {
 **Changes:**
 - IDENTITY → SEQUENCE migration (V5)
 - Immutable DTO caching (RuleSnapshot, RuleIndex)
-- O(1) alert matching (RuleIndexService)
+- O(1) alert matching (AlertMatchingService)
 - Atomic cooldown UPDATE (race condition fix)
 - Soft delete propagation (V4)
 - Idempotency constraints (V3)
@@ -1072,10 +1220,10 @@ WHERE table_name = 'alert_notification'
 ```
 
 **Problem:** Slow alert matching (>100ms)
-**Solution:** Verify RuleIndexService caching:
+**Solution:** Verify AlertMatchingService caching:
 ```bash
 # Check logs for cache rebuild
-tail -f logs/application.log | grep "RuleIndexService"
+tail -f logs/application.log | grep "AlertMatchingService"
 # Should see: "Rebuilding rule index: X rules processed"
 ```
 
