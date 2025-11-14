@@ -59,13 +59,28 @@ public class JwtTokenService {
     /**
      * Load RSA key pairs on application startup.
      * Reads PEM files and converts to Java Key objects.
+     *
+     * P0-SEC-3: Fail fast with clear error if keys are missing.
      */
     @PostConstruct
     public void init() throws Exception {
         log.info("Loading RSA key pairs for JWT signing/verification");
-        this.privateKey = loadPrivateKey();
-        this.publicKey = loadPublicKey();
-        log.info("Successfully loaded RSA keys with key ID: {}", currentKeyId);
+        log.info("Private key path: {}", privateKeyResource);
+        log.info("Public key path: {}", publicKeyResource);
+
+        try {
+            this.privateKey = loadPrivateKey();
+            this.publicKey = loadPublicKey();
+            log.info("Successfully loaded RSA keys with key ID: {}", currentKeyId);
+        } catch (Exception e) {
+            log.error("CRITICAL: Failed to load RSA keys. Application cannot start without valid JWT keys.");
+            log.error("Please ensure RSA key files exist at the configured paths:");
+            log.error("  - Private key: {}", privateKeyResource);
+            log.error("  - Public key: {}", publicKeyResource);
+            log.error("To generate keys, run: scripts/generate-rsa-keys.sh");
+            log.error("Or set environment variables JWT_PRIVATE_KEY_PATH and JWT_PUBLIC_KEY_PATH");
+            throw new IllegalStateException("RSA key initialization failed - see logs above for details", e);
+        }
     }
 
     /**
