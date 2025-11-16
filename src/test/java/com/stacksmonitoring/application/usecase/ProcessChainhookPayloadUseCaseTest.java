@@ -47,12 +47,15 @@ class ProcessChainhookPayloadUseCaseTest {
     @Mock
     private com.stacksmonitoring.domain.repository.AlertNotificationRepository alertNotificationRepository;
 
+    @Mock
+    private io.micrometer.core.instrument.MeterRegistry meterRegistry;
+
     private ProcessChainhookPayloadUseCase useCase;
 
     @BeforeEach
     void setUp() {
         useCase = new ProcessChainhookPayloadUseCase(parser, blockRepository, transactionRepository,
-            alertMatchingService, eventPublisher, alertNotificationRepository);
+            alertMatchingService, eventPublisher, alertNotificationRepository, meterRegistry);
     }
 
     @Test
