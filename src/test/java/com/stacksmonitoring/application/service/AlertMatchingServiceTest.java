@@ -35,11 +35,14 @@ class AlertMatchingServiceTest {
     @Mock
     private AlertNotificationRepository alertNotificationRepository;
 
+    @Mock
+    private io.micrometer.core.instrument.MeterRegistry meterRegistry;
+
     private AlertMatchingService alertMatchingService;
 
     @BeforeEach
     void setUp() {
-        alertMatchingService = new AlertMatchingService(alertRuleRepository, alertNotificationRepository);
+        alertMatchingService = new AlertMatchingService(alertRuleRepository, alertNotificationRepository, meterRegistry);
     }
 
     @Test

@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.TestPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
@@ -65,14 +66,18 @@ class JwtFingerprintEnforcementTest {
     @DisplayName("P0-SEC-2: Valid JWT + valid fingerprint cookie should allow access")
     void testValidJwtAndValidFingerprint() throws Exception {
         // Generate JWT with fingerprint
-        JwtTokenService.JwtTokenWithFingerprint tokenPair = jwtTokenService.generateToken(TEST_EMAIL);
-        String jwt = tokenPair.token();
-        String fingerprintCookie = tokenPair.fingerprintCookie();
+        String fingerprint = jwtTokenService.generateFingerprint();
+        UserDetails userDetails = org.springframework.security.core.userdetails.User.builder()
+                .username(TEST_EMAIL)
+                .password("dummy")
+                .roles("USER")
+                .build();
+        String jwt = jwtTokenService.generateTokenWithFingerprint(userDetails, "USER", fingerprint);
 
         // Request with both JWT and fingerprint cookie
         mockMvc.perform(get(PROTECTED_ENDPOINT)
                 .header("Authorization", "Bearer " + jwt)
-                .cookie(new Cookie("X-Fingerprint", fingerprintCookie)))
+                .cookie(new Cookie("X-Fingerprint", fingerprint)))
                 .andExpect(status().is2xxSuccessful());
     }
 
@@ -80,8 +85,13 @@ class JwtFingerprintEnforcementTest {
     @DisplayName("P0-SEC-2: Valid JWT + missing fingerprint cookie should return 401")
     void testValidJwtMissingFingerprint() throws Exception {
         // Generate JWT with fingerprint
-        JwtTokenService.JwtTokenWithFingerprint tokenPair = jwtTokenService.generateToken(TEST_EMAIL);
-        String jwt = tokenPair.token();
+        String fingerprint = jwtTokenService.generateFingerprint();
+        UserDetails userDetails = org.springframework.security.core.userdetails.User.builder()
+                .username(TEST_EMAIL)
+                .password("dummy")
+                .roles("USER")
+                .build();
+        String jwt = jwtTokenService.generateTokenWithFingerprint(userDetails, "USER", fingerprint);
 
         // Request with JWT but WITHOUT fingerprint cookie (sidejacking scenario)
         mockMvc.perform(get(PROTECTED_ENDPOINT)
@@ -95,8 +105,13 @@ class JwtFingerprintEnforcementTest {
     @DisplayName("P0-SEC-2: Valid JWT + wrong fingerprint cookie should return 401")
     void testValidJwtWrongFingerprint() throws Exception {
         // Generate JWT with fingerprint
-        JwtTokenService.JwtTokenWithFingerprint tokenPair = jwtTokenService.generateToken(TEST_EMAIL);
-        String jwt = tokenPair.token();
+        String fingerprint = jwtTokenService.generateFingerprint();
+        UserDetails userDetails = org.springframework.security.core.userdetails.User.builder()
+                .username(TEST_EMAIL)
+                .password("dummy")
+                .roles("USER")
+                .build();
+        String jwt = jwtTokenService.generateTokenWithFingerprint(userDetails, "USER", fingerprint);
 
         // Use a different fingerprint (attacker guessing)
         String wrongFingerprint = "wrong-fingerprint-value-123";
@@ -112,20 +127,24 @@ class JwtFingerprintEnforcementTest {
     @DisplayName("P0-SEC-2: Multiple requests with same valid JWT and fingerprint should succeed")
     void testReusableTokenWithFingerprint() throws Exception {
         // Generate JWT with fingerprint
-        JwtTokenService.JwtTokenWithFingerprint tokenPair = jwtTokenService.generateToken(TEST_EMAIL);
-        String jwt = tokenPair.token();
-        String fingerprintCookie = tokenPair.fingerprintCookie();
+        String fingerprint = jwtTokenService.generateFingerprint();
+        UserDetails userDetails = org.springframework.security.core.userdetails.User.builder()
+                .username(TEST_EMAIL)
+                .password("dummy")
+                .roles("USER")
+                .build();
+        String jwt = jwtTokenService.generateTokenWithFingerprint(userDetails, "USER", fingerprint);
 
         // First request
         mockMvc.perform(get(PROTECTED_ENDPOINT)
                 .header("Authorization", "Bearer " + jwt)
-                .cookie(new Cookie("X-Fingerprint", fingerprintCookie)))
+                .cookie(new Cookie("X-Fingerprint", fingerprint)))
                 .andExpect(status().is2xxSuccessful());
 
         // Second request with same JWT + fingerprint (should also succeed)
         mockMvc.perform(get(PROTECTED_ENDPOINT)
                 .header("Authorization", "Bearer " + jwt)
-                .cookie(new Cookie("X-Fingerprint", fingerprintCookie)))
+                .cookie(new Cookie("X-Fingerprint", fingerprint)))
                 .andExpect(status().is2xxSuccessful());
     }
 
@@ -134,8 +153,13 @@ class JwtFingerprintEnforcementTest {
     void testTokenStolenWithoutCookie() throws Exception {
         // Scenario: Attacker steals JWT via XSS (reads localStorage)
         // but cannot access HttpOnly fingerprint cookie
-        JwtTokenService.JwtTokenWithFingerprint tokenPair = jwtTokenService.generateToken(TEST_EMAIL);
-        String stolenJwt = tokenPair.token();
+        String fingerprint = jwtTokenService.generateFingerprint();
+        UserDetails userDetails = org.springframework.security.core.userdetails.User.builder()
+                .username(TEST_EMAIL)
+                .password("dummy")
+                .roles("USER")
+                .build();
+        String stolenJwt = jwtTokenService.generateTokenWithFingerprint(userDetails, "USER", fingerprint);
         // Fingerprint cookie is NOT stolen (HttpOnly protection)
 
         // Attacker tries to use stolen JWT without fingerprint cookie
